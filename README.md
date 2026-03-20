@@ -118,6 +118,26 @@ bg-dispatch -a codex \
   -n "auth-tests" -w ./project
 ```
 
+## CLI Monitoring (bgd)
+
+The `bgd` CLI tool provides interactive monitoring for background tasks.
+
+```bash
+bgd tasks                         # List all tasks with status table
+bgd tasks --status running        # Filter by status
+bgd status                        # Quick overview with counts + active details
+bgd show <task>                   # Detailed view (partial name match OK)
+bgd logs <task>                   # Last 50 lines of output (ANSI stripped)
+bgd logs <task> -f                # Follow output in real-time
+bgd progress <task>               # Show .dev-progress/progress.md
+bgd cancel <task>                 # Cancel a running task
+bgd resume <task>                 # Resume interrupted task
+bgd clean                         # Remove done/killed tasks older than 24h
+bgd clean --all --dry-run         # Preview full cleanup
+```
+
+Status icons: 🏃 running, ✅ done (exit 0), ⚠️ done (exit != 0), ❌ killed, ⏸️ cancelled
+
 ## Notification System
 
 ### Built-in Notifiers
