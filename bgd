@@ -1,0 +1,837 @@
+#!/usr/bin/env bash
+#
+# bgd — CLI monitoring tool for bg-dispatch tasks.
+#
+# Provides interactive task monitoring commands for checking on background
+# coding agents dispatched by bg-dispatch.
+#
+# Usage: bgd <command> [args]
+#
+
+set -euo pipefail
+
+# === Configuration ===
+BG_DISPATCH_DIR="${BG_DISPATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+BG_DISPATCH_DATA_DIR="${BG_DISPATCH_DATA_DIR:-$BG_DISPATCH_DIR/data}"
+TASKS_DIR="$BG_DISPATCH_DATA_DIR/tasks"
+
+# === Helper Functions ===
+
+# Find task directory by name or id (partial match, most recent wins)
+_find_task() {
+  local query="$1"
+  local best_match=""
+  local best_time=0
+
+  if [[ ! -d "$TASKS_DIR" ]]; then
+    return 1
+  fi
+
+  for meta in "$TASKS_DIR"/*/meta.json; do
+    [[ -f "$meta" ]] || continue
+    local task_dir
+    task_dir="$(dirname "$meta")"
+    local task_id task_name started_at
+    task_id=$(jq -r '.task_id // ""' "$meta" 2>/dev/null)
+    task_name=$(jq -r '.task_name // ""' "$meta" 2>/dev/null)
+    started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+
+    # Match by exact task_id, exact task_name, or partial match on either
+    if [[ "$task_id" == "$query" ]] || [[ "$task_name" == "$query" ]] || \
+       [[ "$task_id" == *"$query"* ]] || [[ "$task_name" == *"$query"* ]]; then
+      local ts
+      ts=$(date -d "$started_at" +%s 2>/dev/null || echo 0)
+      if [[ "$ts" -gt "$best_time" ]]; then
+        best_time="$ts"
+        best_match="$task_dir"
+      fi
+    fi
+  done
+
+  if [[ -n "$best_match" ]]; then
+    echo "$best_match"
+    return 0
+  fi
+  return 1
+}
+
+# Calculate human-readable duration from seconds
+_calc_duration() {
+  local seconds="$1"
+  if [[ "$seconds" -lt 60 ]]; then
+    echo "${seconds}s"
+  elif [[ "$seconds" -lt 3600 ]]; then
+    local mins=$((seconds / 60))
+    local secs=$((seconds % 60))
+    echo "${mins}m${secs}s"
+  else
+    local hours=$((seconds / 3600))
+    local mins=$(( (seconds % 3600) / 60 ))
+    echo "${hours}h${mins}m"
+  fi
+}
+
+# Calculate duration between two ISO timestamps or from start to now
+_calc_task_duration() {
+  local started_at="$1"
+  local completed_at="${2:-}"
+  local start_ts end_ts
+
+  start_ts=$(date -d "$started_at" +%s 2>/dev/null || echo 0)
+  if [[ -n "$completed_at" ]] && [[ "$completed_at" != "null" ]]; then
+    end_ts=$(date -d "$completed_at" +%s 2>/dev/null || echo 0)
+  else
+    end_ts=$(date +%s)
+  fi
+
+  local elapsed=$((end_ts - start_ts))
+  if [[ "$elapsed" -lt 0 ]]; then
+    elapsed=0
+  fi
+  echo "$elapsed"
+}
+
+# Strip ANSI escape codes
+_strip_ansi() {
+  sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b([0-9;]*[a-zA-Z]//g; s/\r//g'
+}
+
+# Extract one-line progress summary from progress.md
+_get_progress_summary() {
+  local progress_file="$1"
+  if [[ ! -f "$progress_file" ]]; then
+    echo "(no progress file)"
+    return
+  fi
+  # Get the Status line
+  local status_line
+  status_line=$(grep -m1 '^## Status:' "$progress_file" 2>/dev/null | sed 's/^## Status: *//' || echo "")
+  if [[ -n "$status_line" ]]; then
+    echo "$status_line"
+  else
+    # Fallback: count completed items
+    local completed
+    completed=$(grep -c '^\- \[x\]\|^- .*done\|^- .*complete' "$progress_file" 2>/dev/null || echo "0")
+    echo "${completed} items completed"
+  fi
+}
+
+# Get status icon from meta.json fields
+_status_icon() {
+  local status="$1"
+  local exit_code="${2:-0}"
+  local kill_reason="${3:-}"
+
+  case "$status" in
+    running)
+      echo "🏃"
+      ;;
+    done)
+      if [[ "$exit_code" -eq 0 ]]; then
+        echo "✅"
+      else
+        echo "⚠️"
+      fi
+      ;;
+    killed)
+      if [[ "$kill_reason" == "user_cancelled" ]]; then
+        echo "⏸️"
+      else
+        echo "❌"
+      fi
+      ;;
+    *)
+      echo "❓"
+      ;;
+  esac
+}
+
+# === Commands ===
+
+cmd_tasks() {
+  local filter="all"
+  local limit=20
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status) filter="$2"; shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      -h|--help)
+        echo "Usage: bgd tasks [--status running|done|killed|all] [--limit N]"
+        echo ""
+        echo "List all tasks in a table format."
+        return 0
+        ;;
+      *) echo "Error: Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [[ ! -d "$TASKS_DIR" ]] || [[ -z "$(ls -A "$TASKS_DIR" 2>/dev/null)" ]]; then
+    echo "No tasks found."
+    return 0
+  fi
+
+  # Collect task data into a sortable format
+  local tasks=()
+  for meta in "$TASKS_DIR"/*/meta.json; do
+    [[ -f "$meta" ]] || continue
+
+    local status task_name adapter started_at completed_at exit_code effective_model workdir kill_reason
+    status=$(jq -r '.status // "unknown"' "$meta" 2>/dev/null)
+    task_name=$(jq -r '.task_name // "unknown"' "$meta" 2>/dev/null)
+    adapter=$(jq -r '.adapter // "unknown"' "$meta" 2>/dev/null)
+    started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+    completed_at=$(jq -r '.completed_at // ""' "$meta" 2>/dev/null)
+    exit_code=$(jq -r '.exit_code // 0' "$meta" 2>/dev/null)
+    effective_model=$(jq -r '.effective_model // .model // ""' "$meta" 2>/dev/null)
+    workdir=$(jq -r '.workdir // ""' "$meta" 2>/dev/null)
+    kill_reason=$(jq -r '.kill_reason // ""' "$meta" 2>/dev/null)
+
+    # Apply filter
+    case "$filter" in
+      running) [[ "$status" != "running" ]] && continue ;;
+      done)    [[ "$status" != "done" ]] && continue ;;
+      killed)  [[ "$status" != "killed" ]] && continue ;;
+      all)     ;;
+      *) echo "Error: Invalid status filter: $filter" >&2; return 1 ;;
+    esac
+
+    local icon duration workdir_base sort_key
+    icon=$(_status_icon "$status" "$exit_code" "$kill_reason")
+
+    local elapsed
+    if [[ "$status" == "running" ]]; then
+      elapsed=$(_calc_task_duration "$started_at")
+      duration="$(_calc_duration "$elapsed")..."
+    elif [[ -n "$completed_at" ]] && [[ "$completed_at" != "null" ]]; then
+      elapsed=$(_calc_task_duration "$started_at" "$completed_at")
+      duration=$(_calc_duration "$elapsed")
+    else
+      duration="-"
+      elapsed=0
+    fi
+
+    workdir_base=$(basename "$workdir" 2>/dev/null || echo "-")
+
+    # Sort key: running=0 (highest), done=1, killed=2; secondary by timestamp descending
+    local start_ts
+    start_ts=$(date -d "$started_at" +%s 2>/dev/null || echo 0)
+    case "$status" in
+      running) sort_key="0-$((999999999 - start_ts))" ;;
+      done)    sort_key="1-$((999999999 - start_ts))" ;;
+      killed)  sort_key="2-$((999999999 - start_ts))" ;;
+      *)       sort_key="3-$((999999999 - start_ts))" ;;
+    esac
+
+    # Truncate long names
+    if [[ ${#task_name} -gt 25 ]]; then
+      task_name="${task_name:0:22}..."
+    fi
+    if [[ ${#effective_model} -gt 20 ]]; then
+      effective_model="${effective_model:0:17}..."
+    fi
+
+    tasks+=("${sort_key}|${icon}|${task_name}|${status}|${adapter}|${duration}|${effective_model}|${workdir_base}")
+  done
+
+  if [[ ${#tasks[@]} -eq 0 ]]; then
+    echo "No tasks match filter: $filter"
+    return 0
+  fi
+
+  # Sort and limit
+  local sorted
+  sorted=$(printf '%s\n' "${tasks[@]}" | sort)
+
+  echo ""
+  printf "  %-2s %-25s %-10s %-14s %-12s %-20s %s\n" "" "NAME" "STATUS" "ADAPTER" "DURATION" "MODEL" "WORKDIR"
+  printf "  %-2s %-25s %-10s %-14s %-12s %-20s %s\n" "" "----" "------" "-------" "--------" "-----" "-------"
+
+  local count=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$count" -ge "$limit" ]] && break
+    count=$((count + 1))
+
+    local icon name status adapter duration model wdir
+    icon=$(echo "$line" | cut -d'|' -f2)
+    name=$(echo "$line" | cut -d'|' -f3)
+    status=$(echo "$line" | cut -d'|' -f4)
+    adapter=$(echo "$line" | cut -d'|' -f5)
+    duration=$(echo "$line" | cut -d'|' -f6)
+    model=$(echo "$line" | cut -d'|' -f7)
+    wdir=$(echo "$line" | cut -d'|' -f8)
+
+    printf "  %-2s %-25s %-10s %-14s %-12s %-20s %s\n" "$icon" "$name" "$status" "$adapter" "$duration" "$model" "$wdir"
+  done <<< "$sorted"
+
+  local total=${#tasks[@]}
+  echo ""
+  echo "  Total: $total task(s)"
+  if [[ "$count" -lt "$total" ]]; then
+    echo "  (showing $count of $total — use --limit to see more)"
+  fi
+  echo ""
+}
+
+cmd_status() {
+  if [[ ! -d "$TASKS_DIR" ]] || [[ -z "$(ls -A "$TASKS_DIR" 2>/dev/null)" ]]; then
+    echo "No tasks found."
+    return 0
+  fi
+
+  local running=0 done_ok=0 done_fail=0 killed=0 total=0
+
+  for meta in "$TASKS_DIR"/*/meta.json; do
+    [[ -f "$meta" ]] || continue
+    total=$((total + 1))
+    local status exit_code
+    status=$(jq -r '.status // "unknown"' "$meta" 2>/dev/null)
+    exit_code=$(jq -r '.exit_code // 0' "$meta" 2>/dev/null)
+
+    case "$status" in
+      running) running=$((running + 1)) ;;
+      done)
+        if [[ "$exit_code" -eq 0 ]]; then
+          done_ok=$((done_ok + 1))
+        else
+          done_fail=$((done_fail + 1))
+        fi
+        ;;
+      killed) killed=$((killed + 1)) ;;
+    esac
+  done
+
+  echo ""
+  echo "  bg-dispatch Status"
+  echo "  =================="
+  echo "  🏃 Running:    $running"
+  echo "  ✅ Succeeded:  $done_ok"
+  echo "  ⚠️  Failed:     $done_fail"
+  echo "  ❌ Killed:     $killed"
+  echo "  ─────────────────"
+  echo "  Total:         $total"
+  echo ""
+
+  # Show detail for each running task
+  if [[ "$running" -gt 0 ]]; then
+    echo "  Active Tasks:"
+    echo "  ─────────────"
+    for meta in "$TASKS_DIR"/*/meta.json; do
+      [[ -f "$meta" ]] || continue
+      local status
+      status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+      [[ "$status" != "running" ]] && continue
+
+      local task_name adapter started_at workdir effective_model
+      task_name=$(jq -r '.task_name // "unknown"' "$meta" 2>/dev/null)
+      adapter=$(jq -r '.adapter // "unknown"' "$meta" 2>/dev/null)
+      started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+      workdir=$(jq -r '.workdir // ""' "$meta" 2>/dev/null)
+      effective_model=$(jq -r '.effective_model // .model // ""' "$meta" 2>/dev/null)
+
+      local elapsed duration
+      elapsed=$(_calc_task_duration "$started_at")
+      duration=$(_calc_duration "$elapsed")
+
+      echo "  🏃 $task_name"
+      echo "    Adapter:  $adapter"
+      echo "    Model:    $effective_model"
+      echo "    Elapsed:  $duration"
+      echo "    Workdir:  $workdir"
+
+      # Progress summary
+      local progress_file="$workdir/.dev-progress/progress.md"
+      if [[ -f "$progress_file" ]]; then
+        local summary
+        summary=$(_get_progress_summary "$progress_file")
+        echo "    Progress: $summary"
+
+        # Last activity (most recent file change in workdir)
+        local last_mod
+        last_mod=$(find "$workdir" -not -path "*/.git/*" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+        if [[ -n "$last_mod" ]]; then
+          local last_ts now_ts age
+          last_ts=${last_mod%.*}
+          now_ts=$(date +%s)
+          age=$((now_ts - last_ts))
+          echo "    Activity: $(_calc_duration "$age") ago"
+        fi
+      fi
+      echo ""
+    done
+  fi
+}
+
+cmd_show() {
+  if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    echo "Usage: bgd show <task-name-or-id>"
+    echo ""
+    echo "Show detailed view of a specific task."
+    return 0
+  fi
+
+  local query="$1"
+  local task_dir
+  task_dir=$(_find_task "$query") || {
+    echo "Error: No task found matching '$query'" >&2
+    return 1
+  }
+
+  local meta="$task_dir/meta.json"
+  local task_id task_name status adapter started_at completed_at exit_code
+  local effective_model workdir kill_reason is_resume callback_session
+
+  task_id=$(jq -r '.task_id // ""' "$meta" 2>/dev/null)
+  task_name=$(jq -r '.task_name // ""' "$meta" 2>/dev/null)
+  status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+  adapter=$(jq -r '.adapter // ""' "$meta" 2>/dev/null)
+  started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+  completed_at=$(jq -r '.completed_at // ""' "$meta" 2>/dev/null)
+  exit_code=$(jq -r '.exit_code // 0' "$meta" 2>/dev/null)
+  effective_model=$(jq -r '.effective_model // .model // ""' "$meta" 2>/dev/null)
+  workdir=$(jq -r '.workdir // ""' "$meta" 2>/dev/null)
+  kill_reason=$(jq -r '.kill_reason // ""' "$meta" 2>/dev/null)
+  is_resume=$(jq -r '.is_resume // false' "$meta" 2>/dev/null)
+  callback_session=$(jq -r '.callback_session // ""' "$meta" 2>/dev/null)
+
+  local icon
+  icon=$(_status_icon "$status" "$exit_code" "$kill_reason")
+
+  local elapsed duration
+  if [[ "$status" == "running" ]]; then
+    elapsed=$(_calc_task_duration "$started_at")
+    duration="$(_calc_duration "$elapsed") (running)"
+  elif [[ -n "$completed_at" ]] && [[ "$completed_at" != "null" ]]; then
+    elapsed=$(_calc_task_duration "$started_at" "$completed_at")
+    duration=$(_calc_duration "$elapsed")
+  else
+    duration="-"
+  fi
+
+  echo ""
+  echo "  $icon Task: $task_name"
+  echo "  ════════════════════════════════════"
+  echo "  ID:         $task_id"
+  echo "  Status:     $status (exit: $exit_code)"
+  echo "  Adapter:    $adapter"
+  echo "  Model:      $effective_model"
+  echo "  Duration:   $duration"
+  echo "  Started:    $started_at"
+  [[ -n "$completed_at" ]] && [[ "$completed_at" != "null" ]] && echo "  Completed:  $completed_at"
+  echo "  Workdir:    $workdir"
+  [[ -n "$kill_reason" ]] && [[ "$kill_reason" != "null" ]] && echo "  Kill reason: $kill_reason"
+  [[ "$is_resume" == "true" ]] && echo "  Resumed:    yes"
+  [[ -n "$callback_session" ]] && [[ "$callback_session" != "null" ]] && echo "  Callback:   $callback_session"
+
+  # Show progress.md if available
+  local progress_file="$workdir/.dev-progress/progress.md"
+  if [[ -f "$progress_file" ]]; then
+    echo ""
+    echo "  Progress (.dev-progress/progress.md):"
+    echo "  ──────────────────────────────────────"
+    sed 's/^/  /' "$progress_file"
+  fi
+
+  # Show recent git log from workdir
+  if [[ -d "$workdir/.git" ]]; then
+    echo ""
+    echo "  Recent Commits:"
+    echo "  ──────────────────────────────────────"
+    git -C "$workdir" log --oneline -10 2>/dev/null | sed 's/^/  /' || echo "  (unable to read git log)"
+  fi
+  echo ""
+}
+
+cmd_logs() {
+  local query=""
+  local lines=50
+  local follow=""
+  local watchdog=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n) lines="$2"; shift 2 ;;
+      -f) follow="true"; shift ;;
+      --watchdog) watchdog="true"; shift ;;
+      -h|--help)
+        echo "Usage: bgd logs <task-name-or-id> [-n lines] [-f] [--watchdog]"
+        echo ""
+        echo "Show task output logs."
+        echo "  -n N          Number of lines (default: 50)"
+        echo "  -f            Follow (tail -f)"
+        echo "  --watchdog    Show watchdog.log instead of output.txt"
+        return 0
+        ;;
+      *)
+        if [[ -z "$query" ]]; then
+          query="$1"; shift
+        else
+          echo "Error: Unknown option: $1" >&2; return 1
+        fi
+        ;;
+    esac
+  done
+
+  if [[ -z "$query" ]]; then
+    echo "Usage: bgd logs <task-name-or-id> [-n lines] [-f] [--watchdog]" >&2
+    return 1
+  fi
+
+  local task_dir
+  task_dir=$(_find_task "$query") || {
+    echo "Error: No task found matching '$query'" >&2
+    return 1
+  }
+
+  local log_file
+  if [[ "$watchdog" == "true" ]]; then
+    log_file="$task_dir/watchdog.log"
+  else
+    log_file="$task_dir/output.txt"
+  fi
+
+  if [[ ! -f "$log_file" ]]; then
+    echo "No log file found: $log_file"
+    return 0
+  fi
+
+  if [[ "$follow" == "true" ]]; then
+    tail -f "$log_file" | _strip_ansi
+  else
+    tail -n "$lines" "$log_file" | _strip_ansi
+  fi
+}
+
+cmd_clean() {
+  local all_flag=""
+  local dry_run=""
+  # 24 hours in seconds
+  local max_age_seconds=86400
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all_flag="true"; shift ;;
+      --dry-run) dry_run="true"; shift ;;
+      -h|--help)
+        echo "Usage: bgd clean [--all] [--dry-run]"
+        echo ""
+        echo "Remove completed/killed task data."
+        echo "  --all       Remove all done/killed (ignore age)"
+        echo "  --dry-run   Preview what would be removed"
+        return 0
+        ;;
+      *) echo "Error: Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [[ ! -d "$TASKS_DIR" ]]; then
+    echo "No tasks directory found."
+    return 0
+  fi
+
+  local removed=0
+  local skipped=0
+  local orphans_killed=0
+  local now
+  now=$(date +%s)
+
+  for task_dir in "$TASKS_DIR"/*/; do
+    [[ -d "$task_dir" ]] || continue
+    local meta="$task_dir/meta.json"
+    [[ -f "$meta" ]] || continue
+
+    local status completed_at
+    status=$(jq -r '.status // "unknown"' "$meta" 2>/dev/null)
+    completed_at=$(jq -r '.completed_at // ""' "$meta" 2>/dev/null)
+
+    # NEVER touch running tasks
+    if [[ "$status" == "running" ]]; then
+      # Check for orphan processes
+      local pid_file="$task_dir/pid"
+      if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+          if [[ "$dry_run" == "true" ]]; then
+            echo "[dry-run] Would kill orphan and mark killed: $(basename "$task_dir")"
+          else
+            jq '. + {status: "killed", kill_reason: "orphan_process"}' "$meta" > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
+            echo "Marked orphan as killed: $(basename "$task_dir")"
+          fi
+          orphans_killed=$((orphans_killed + 1))
+        fi
+      fi
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    # Only remove done/killed tasks
+    if [[ "$status" != "done" ]] && [[ "$status" != "killed" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    # Age check (unless --all)
+    if [[ "$all_flag" != "true" ]] && [[ -n "$completed_at" ]] && [[ "$completed_at" != "null" ]]; then
+      local completed_ts age
+      completed_ts=$(date -d "$completed_at" +%s 2>/dev/null || echo 0)
+      age=$((now - completed_ts))
+      if [[ "$age" -lt "$max_age_seconds" ]]; then
+        skipped=$((skipped + 1))
+        continue
+      fi
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+      echo "[dry-run] Would remove: $(basename "$task_dir") ($status)"
+    else
+      rm -rf "$task_dir"
+      echo "Removed: $(basename "$task_dir") ($status)"
+    fi
+    removed=$((removed + 1))
+  done
+
+  echo ""
+  echo "Clean summary: ${removed} removed, ${skipped} skipped, ${orphans_killed} orphans handled"
+  if [[ "$dry_run" == "true" ]]; then
+    echo "(dry-run mode — no changes made)"
+  fi
+}
+
+cmd_progress() {
+  if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    echo "Usage: bgd progress <task-name-or-id>"
+    echo ""
+    echo "Show .dev-progress/progress.md from task workdir."
+    return 0
+  fi
+
+  local query="$1"
+  local task_dir
+  task_dir=$(_find_task "$query") || {
+    echo "Error: No task found matching '$query'" >&2
+    return 1
+  }
+
+  local meta="$task_dir/meta.json"
+  local workdir status started_at task_name
+  workdir=$(jq -r '.workdir // ""' "$meta" 2>/dev/null)
+  status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+  started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+  task_name=$(jq -r '.task_name // ""' "$meta" 2>/dev/null)
+
+  local progress_file="$workdir/.dev-progress/progress.md"
+  if [[ ! -f "$progress_file" ]]; then
+    echo "No progress file found at: $progress_file"
+    return 0
+  fi
+
+  echo ""
+  echo "  Task: $task_name ($status)"
+
+  if [[ "$status" == "running" ]]; then
+    local elapsed duration
+    elapsed=$(_calc_task_duration "$started_at")
+    duration=$(_calc_duration "$elapsed")
+    echo "  Elapsed: $duration"
+
+    # Last file change in workdir
+    local last_mod
+    last_mod=$(find "$workdir" -not -path "*/.git/*" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+    if [[ -n "$last_mod" ]]; then
+      local last_ts now_ts age
+      last_ts=${last_mod%.*}
+      now_ts=$(date +%s)
+      age=$((now_ts - last_ts))
+      echo "  Last file change: $(_calc_duration "$age") ago"
+    fi
+  fi
+
+  echo "  ──────────────────────────────────────"
+  cat "$progress_file"
+  echo ""
+}
+
+cmd_cancel() {
+  if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    echo "Usage: bgd cancel <task-name-or-id>"
+    echo ""
+    echo "Cancel a running task."
+    return 0
+  fi
+
+  local query="$1"
+  local task_dir
+  task_dir=$(_find_task "$query") || {
+    echo "Error: No task found matching '$query'" >&2
+    return 1
+  }
+
+  local meta="$task_dir/meta.json"
+  local status task_name workdir
+  status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+  task_name=$(jq -r '.task_name // ""' "$meta" 2>/dev/null)
+  workdir=$(jq -r '.workdir // ""' "$meta" 2>/dev/null)
+
+  if [[ "$status" != "running" ]]; then
+    echo "Task '$task_name' is not running (status: $status)"
+    return 1
+  fi
+
+  # Kill the process tree
+  local pid_file="$task_dir/pid"
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "Killing process tree (PID: $pid)..."
+      # Kill the process group
+      kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      sleep 2
+      # Force kill if still alive
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # Kill watchdog if present
+  local watchdog_pid_file="$task_dir/watchdog_pid"
+  if [[ -f "$watchdog_pid_file" ]]; then
+    local wpid
+    wpid=$(cat "$watchdog_pid_file" 2>/dev/null)
+    if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
+      kill -TERM "$wpid" 2>/dev/null || true
+    fi
+  fi
+
+  # Update meta.json
+  local completed_at
+  completed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq --arg ts "$completed_at" \
+    '. + {status: "killed", kill_reason: "user_cancelled", completed_at: $ts}' \
+    "$meta" > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
+
+  # Update task-spec.json if exists
+  local task_spec="$workdir/.dev-progress/task-spec.json"
+  if [[ -f "$task_spec" ]]; then
+    jq '. + {status: "cancelled"}' "$task_spec" > "${task_spec}.tmp" && mv "${task_spec}.tmp" "$task_spec"
+  fi
+
+  # Remove lock file
+  local workdir_hash lock_file
+  workdir_hash=$(echo "$workdir" | md5sum | cut -c1-12)
+  lock_file="$BG_DISPATCH_DATA_DIR/locks/${workdir_hash}.lock"
+  rm -f "$lock_file"
+
+  # Dispatch notifications
+  local notify_script="$BG_DISPATCH_DIR/notify.sh"
+  if [[ -f "$notify_script" ]]; then
+    bash "$notify_script" "$meta" 2>/dev/null || true
+  fi
+
+  echo "Cancelled task: $task_name"
+}
+
+cmd_resume() {
+  if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    echo "Usage: bgd resume <task-name-or-id>"
+    echo ""
+    echo "Resume an interrupted/stalled/killed task."
+    return 0
+  fi
+
+  local query="$1"
+  local task_dir
+  task_dir=$(_find_task "$query") || {
+    echo "Error: No task found matching '$query'" >&2
+    return 1
+  }
+
+  local meta="$task_dir/meta.json"
+  local status adapter workdir task_name
+  status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+  adapter=$(jq -r '.adapter // ""' "$meta" 2>/dev/null)
+  workdir=$(jq -r '.workdir // ""' "$meta" 2>/dev/null)
+  task_name=$(jq -r '.task_name // ""' "$meta" 2>/dev/null)
+
+  if [[ "$status" == "running" ]]; then
+    echo "Task '$task_name' is already running."
+    return 1
+  fi
+
+  if [[ ! -d "$workdir/.dev-progress" ]]; then
+    echo "Error: No .dev-progress/ found in $workdir — cannot resume" >&2
+    return 1
+  fi
+
+  echo "Resuming task: $task_name (adapter: $adapter, workdir: $workdir)"
+  exec "$BG_DISPATCH_DIR/bg-dispatch" --adapter "$adapter" --workdir "$workdir" --resume --force
+}
+
+cmd_help() {
+  cat <<'EOF'
+bgd — CLI monitoring tool for bg-dispatch
+
+Usage: bgd <command> [args]
+
+Commands:
+  tasks                     List all tasks in a table format
+  status                    Quick overview with summary counts
+  show <task>               Detailed view of a specific task
+  logs <task>               Show task output logs
+  progress <task>           Show .dev-progress/progress.md from workdir
+  cancel <task>             Cancel a running task
+  resume <task>             Resume an interrupted task
+  clean                     Remove old completed/killed task data
+  help                      Show this help
+
+Options:
+  tasks --status <filter>   Filter: running, done, killed, all (default: all)
+  tasks --limit <n>         Max tasks to show (default: 20)
+  logs -n <lines>           Number of lines (default: 50)
+  logs -f                   Follow (tail -f)
+  logs --watchdog           Show watchdog.log instead of output.txt
+  clean --all               Remove all done/killed (ignore age)
+  clean --dry-run           Preview what would be removed
+
+Examples:
+  bgd tasks                         # List all tasks
+  bgd tasks --status running        # Show only running tasks
+  bgd status                        # Quick overview
+  bgd show auth-api                 # Show task details (partial match OK)
+  bgd logs auth-api -n 100          # Last 100 lines of output
+  bgd logs auth-api -f              # Follow output in real-time
+  bgd progress auth-api             # Show live progress
+  bgd cancel auth-api               # Cancel a running task
+  bgd resume auth-api               # Resume interrupted task
+  bgd clean --dry-run               # Preview cleanup
+EOF
+}
+
+# === Main Routing ===
+if [[ $# -eq 0 ]]; then
+  cmd_help
+  exit 0
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  tasks)    cmd_tasks "$@" ;;
+  status)   cmd_status "$@" ;;
+  show)     cmd_show "$@" ;;
+  logs)     cmd_logs "$@" ;;
+  clean)    cmd_clean "$@" ;;
+  progress) cmd_progress "$@" ;;
+  cancel)   cmd_cancel "$@" ;;
+  resume)   cmd_resume "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    echo "Error: Unknown command: $COMMAND" >&2
+    echo "Run 'bgd help' for usage." >&2
+    exit 1
+    ;;
+esac

@@ -319,6 +319,67 @@ The output JSON tells you what needs attention:
 - `interrupted` — Tasks that need resuming
 - `stalled` — Tasks that may be stuck
 
+## Monitoring Commands (bgd CLI)
+
+The `bgd` CLI provides interactive task monitoring. Use it to check on background tasks, view logs, and manage task lifecycle.
+
+### List Tasks
+
+```bash
+bgd tasks                         # All tasks
+bgd tasks --status running        # Only running tasks
+bgd tasks --status done           # Only completed tasks
+bgd tasks --limit 5               # Limit output
+```
+
+### Quick Status Overview
+
+```bash
+bgd status                        # Summary counts + active task details
+```
+
+### Show Task Details
+
+```bash
+bgd show auth-api                 # Full metadata + progress + git log
+bgd show db                       # Partial name match OK
+```
+
+### View Logs
+
+```bash
+bgd logs auth-api                 # Last 50 lines of output (ANSI stripped)
+bgd logs auth-api -n 100          # Last 100 lines
+bgd logs auth-api -f              # Follow in real-time
+bgd logs auth-api --watchdog      # Watchdog log instead
+```
+
+### View Progress
+
+```bash
+bgd progress auth-api             # Show .dev-progress/progress.md
+```
+
+### Cancel a Task
+
+```bash
+bgd cancel auth-api               # Kill process tree, update meta, notify
+```
+
+### Resume a Task
+
+```bash
+bgd resume auth-api               # Resume interrupted/killed task
+```
+
+### Clean Up
+
+```bash
+bgd clean                         # Remove done/killed tasks older than 24h
+bgd clean --all                   # Remove all done/killed tasks
+bgd clean --dry-run               # Preview what would be removed
+```
+
 ## File Layout
 
 ```
