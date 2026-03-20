@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+#
+# bg-dispatch — Fire-and-forget background dispatch for heavy coding agents.
+#
+# Launches a coding agent (Claude Code, Aider, etc.) in the background via an
+# adapter, returns immediately. Tracks progress in .dev-progress/ for resumability.
+# On completion, wakes OpenClaw via hook callback or watchdog fallback.
+#
+# Usage: bg-dispatch --adapter <name> --prompt <text> --workdir <dir> [OPTIONS]
+#
+
+set -euo pipefail
+
+# === Configuration ===
+BG_DISPATCH_DIR="${BG_DISPATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+BG_DISPATCH_DATA_DIR="${BG_DISPATCH_DATA_DIR:-$BG_DISPATCH_DIR/data}"
+ADAPTERS_DIR="$BG_DISPATCH_DIR/adapters"
+
+# === Parse Arguments ===
+ADAPTER=""
+PROMPT=""
+TASK_NAME=""
+WORKDIR="$(pwd)"
+MODEL=""
+ALLOWED_TOOLS=""
+AGENT_TEAMS=""
+CALLBACK_SESSION=""
+RESUME_MODE=""
+FORCE_MODE=""
+STALL_TIMEOUT="${BG_DISPATCH_STALL_TIMEOUT:-900}"
+MAX_RUNTIME="${BG_DISPATCH_MAX_RUNTIME:-7200}"
+# Adapter-specific pass-through options (key=value pairs)
+declare -A ADAPTER_OPTS=()
+
+usage() {
+  cat <<'EOF'
+Usage: bg-dispatch [OPTIONS]
+
+Fire-and-forget background dispatch for heavy coding agents.
+
+Required:
+  -a, --adapter NAME         Adapter name (e.g., claude-code)
+  -p, --prompt TEXT          Task prompt (required unless --resume)
+
+Options:
+  -n, --name NAME            Task name for tracking (default: task-<timestamp>)
+  -w, --workdir DIR          Working directory (default: cwd)
+  --resume                   Resume interrupted task from .dev-progress/
+  --force                    Kill existing task for same workdir before starting
+  --model MODEL              Model override (passed to adapter)
+  --allowed-tools TOOLS      Allowed tools list (passed to adapter)
+  --agent-teams              Enable multi-agent/teams mode (passed to adapter)
+  --stall-timeout SECS       Stall detection timeout (default: 900 = 15 min)
+  --max-runtime SECS         Maximum total runtime (default: 7200 = 2 hours)
+  --callback-session KEY     OpenClaw session key to wake on completion
+  --opt KEY=VALUE            Pass adapter-specific option (repeatable)
+  -h, --help                 Show this help
+
+Environment Variables:
+  BG_DISPATCH_DIR            Base directory (default: script location)
+  BG_DISPATCH_DATA_DIR       Data directory (default: $BG_DISPATCH_DIR/data)
+  BG_DISPATCH_STALL_TIMEOUT  Default stall timeout
+  BG_DISPATCH_MAX_RUNTIME    Default max runtime
+
+Adapters:
+  Each adapter is a shell script in adapters/ that implements build_command()
+  and get_env(). See docs/writing-adapters.md for the interface.
+
+  Built-in: claude-code
+
+Examples:
+  # Dispatch a new task
+  bg-dispatch -a claude-code -p "Build user auth API" -n "auth-api" -w ./project
+
+  # Resume after interruption
+  bg-dispatch -a claude-code -w ./project --resume
+
+  # With adapter-specific options
+  bg-dispatch -a claude-code -p "Fix bug #42" --opt permission-mode=none
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -a|--adapter)       ADAPTER="$2"; shift 2 ;;
+    -p|--prompt)        PROMPT="$2"; shift 2 ;;
+    -n|--name)          TASK_NAME="$2"; shift 2 ;;
+    -w|--workdir)       WORKDIR="$2"; shift 2 ;;
+    --model)            MODEL="$2"; shift 2 ;;
+    --allowed-tools)    ALLOWED_TOOLS="$2"; shift 2 ;;
+    --agent-teams)      AGENT_TEAMS="true"; shift ;;
+    --callback-session) CALLBACK_SESSION="$2"; shift 2 ;;
+    --resume)           RESUME_MODE="true"; shift ;;
+    --force)            FORCE_MODE="true"; shift ;;
+    --stall-timeout)    STALL_TIMEOUT="$2"; shift 2 ;;
+    --max-runtime)      MAX_RUNTIME="$2"; shift 2 ;;
+    --opt)
+      KEY="${2%%=*}"
+      VALUE="${2#*=}"
+      ADAPTER_OPTS["$KEY"]="$VALUE"
+      shift 2 ;;
+    -h|--help)          usage; exit 0 ;;
+    *) echo "Error: Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+# === Validate ===
+if [[ -z "$ADAPTER" ]]; then
+  echo "Error: --adapter is required" >&2
+  exit 1
+fi
+
+ADAPTER_SCRIPT="$ADAPTERS_DIR/${ADAPTER}.sh"
+if [[ ! -f "$ADAPTER_SCRIPT" ]]; then
+  echo "Error: Adapter not found: $ADAPTER_SCRIPT" >&2
+  echo "Available adapters:" >&2
+  ls "$ADAPTERS_DIR"/*.sh 2>/dev/null | xargs -I{} basename {} .sh | sed 's/^/  /' >&2
+  exit 1
+fi
+
+# Resolve to absolute path
+WORKDIR="$(cd "$WORKDIR" 2>/dev/null && pwd)"
+
+# === Load Adapter ===
+# shellcheck source=/dev/null
+source "$ADAPTER_SCRIPT"
+
+# Validate adapter implements required functions
+for fn in build_command adapter_validate; do
+  if ! declare -f "$fn" > /dev/null 2>&1; then
+    echo "Error: Adapter '$ADAPTER' missing required function: $fn" >&2
+    exit 1
+  fi
+done
+
+# Let adapter validate its own prerequisites
+adapter_validate
+
+# === Resume Mode ===
+PROGRESS_DIR="$WORKDIR/.dev-progress"
+
+if [[ "$RESUME_MODE" == "true" ]]; then
+  if [[ ! -d "$PROGRESS_DIR" ]]; then
+    echo "Error: No .dev-progress/ found in $WORKDIR — nothing to resume" >&2
+    exit 1
+  fi
+  if [[ ! -f "$PROGRESS_DIR/task-spec.json" ]]; then
+    echo "Error: No task-spec.json in $PROGRESS_DIR" >&2
+    exit 1
+  fi
+
+  # Read metadata from previous run
+  TASK_NAME=$(jq -r '.task_name // "resumed-task"' "$PROGRESS_DIR/task-spec.json")
+  ALLOWED_TOOLS=$(jq -r '.allowed_tools // ""' "$PROGRESS_DIR/task-spec.json")
+  AGENT_TEAMS=$(jq -r 'if .agent_teams then "true" else "" end' "$PROGRESS_DIR/task-spec.json")
+  MODEL=$(jq -r '.model // ""' "$PROGRESS_DIR/task-spec.json")
+  ORIGINAL_PROMPT=$(jq -r '.prompt // ""' "$PROGRESS_DIR/task-spec.json")
+
+  # Build resume prompt
+  PROMPT="You are resuming an interrupted coding task. A previous session was working on this but was interrupted.
+
+## Resume Protocol
+1. Read .dev-progress/progress.md to understand what was already done
+2. Run: git log --oneline -20 to see recent commits
+3. Run the project's tests to check current state
+4. Pick up from where the last session left off — do NOT redo completed work
+5. Update .dev-progress/progress.md as you complete each step
+6. Commit after each meaningful unit of work
+
+## Rules
+- Do NOT start over. Read progress first, then decide where to resume.
+- If progress.md shows 'none yet' or is empty, treat as fresh start.
+- If tests pass for completed features, move on to next incomplete one.
+
+## Original Task
+${ORIGINAL_PROMPT}"
+
+  echo "📎 Resuming task: $TASK_NAME from $PROGRESS_DIR"
+fi
+
+if [[ -z "$PROMPT" ]]; then
+  echo "Error: --prompt is required (or use --resume)" >&2
+  exit 1
+fi
+
+# === Workdir Lock (prevent duplicates) ===
+LOCK_DIR="$BG_DISPATCH_DATA_DIR/locks"
+mkdir -p "$LOCK_DIR"
+WORKDIR_HASH=$(echo "$WORKDIR" | md5sum | cut -c1-12)
+LOCK_FILE="$LOCK_DIR/${WORKDIR_HASH}.lock"
+
+if [[ -f "$LOCK_FILE" ]]; then
+  EXISTING_PID=$(cat "$LOCK_FILE" 2>/dev/null)
+  if kill -0 "$EXISTING_PID" 2>/dev/null; then
+    if [[ "${FORCE_MODE:-}" != "true" ]]; then
+      echo "⚠️  Another task is already running for this workdir!" >&2
+      echo "   Workdir: $WORKDIR" >&2
+      echo "   PID: $EXISTING_PID" >&2
+      echo "Use --force to kill and restart." >&2
+      exit 1
+    fi
+    echo "🔪 Force mode: killing existing task (PID $EXISTING_PID)..." >&2
+    kill -TERM "$EXISTING_PID" 2>/dev/null || true
+    sleep 2
+    # Mark old tasks as killed
+    for meta in "$BG_DISPATCH_DATA_DIR/tasks"/*/meta.json; do
+      [ -f "$meta" ] || continue
+      meta_status=$(jq -r '.status' "$meta" 2>/dev/null)
+      meta_workdir=$(jq -r '.workdir' "$meta" 2>/dev/null)
+      if [[ "$meta_status" == "running" ]] && [[ "$meta_workdir" == "$WORKDIR" ]]; then
+        jq '.status = "killed" | .kill_reason = "superseded" | .completed_at = (now | strftime("%Y-%m-%dT%H:%M:%SZ"))' \
+          "$meta" > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
+      fi
+    done
+  else
+    rm -f "$LOCK_FILE"
+  fi
+fi
+
+# === Generate Task ID ===
+TIMESTAMP=$(date +%s)
+if [[ -z "$TASK_NAME" ]]; then
+  TASK_NAME="task-$TIMESTAMP"
+fi
+TASK_ID="${TASK_NAME}-${TIMESTAMP}"
+
+TASK_DIR="$BG_DISPATCH_DATA_DIR/tasks/$TASK_ID"
+mkdir -p "$TASK_DIR"
+
+# === Write .dev-progress/ (initial dispatch only) ===
+if [[ "$RESUME_MODE" != "true" ]]; then
+  mkdir -p "$PROGRESS_DIR"
+
+  jq -n \
+    --arg task_name "$TASK_NAME" \
+    --arg prompt "$PROMPT" \
+    --arg workdir "$WORKDIR" \
+    --arg adapter "$ADAPTER" \
+    --arg model "$MODEL" \
+    --arg allowed_tools "$ALLOWED_TOOLS" \
+    --arg agent_teams "${AGENT_TEAMS:-false}" \
+    --arg created_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    '{
+      task_name: $task_name,
+      prompt: $prompt,
+      workdir: $workdir,
+      adapter: $adapter,
+      model: $model,
+      allowed_tools: $allowed_tools,
+      agent_teams: ($agent_teams == "true"),
+      created_at: $created_at,
+      status: "in_progress"
+    }' > "$PROGRESS_DIR/task-spec.json"
+
+  cat > "$PROGRESS_DIR/progress.md" <<PROGRESS_EOF
+# Task Progress: $TASK_NAME
+Created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+## Status: IN PROGRESS
+
+## Completed
+(none yet)
+
+## In Progress
+(starting)
+
+## Remaining
+(see task-spec.json for full requirements)
+
+## Session Log
+- $(date -u +"%Y-%m-%dT%H:%M:%SZ"): Task started
+PROGRESS_EOF
+
+  # Inject progress tracking into prompt
+  PROMPT="$PROMPT
+
+## Progress Tracking
+Maintain .dev-progress/progress.md throughout your work:
+1. Before starting: read .dev-progress/progress.md and git log --oneline -20
+2. After completing each step: update progress.md
+3. Commit progress.md alongside your code changes
+4. At session end: ensure progress.md reflects current state"
+fi
+
+# === Build adapter command ===
+# Export variables for the adapter
+export BG_DISPATCH_PROMPT="$PROMPT"
+export BG_DISPATCH_MODEL="$MODEL"
+export BG_DISPATCH_ALLOWED_TOOLS="$ALLOWED_TOOLS"
+export BG_DISPATCH_AGENT_TEAMS="${AGENT_TEAMS:-}"
+export BG_DISPATCH_WORKDIR="$WORKDIR"
+
+# Export adapter-specific options
+for key in "${!ADAPTER_OPTS[@]}"; do
+  export "BG_DISPATCH_OPT_${key//-/_}=${ADAPTER_OPTS[$key]}"
+done
+
+ADAPTER_CMD=$(build_command)
+EFFECTIVE_MODEL=$(adapter_effective_model 2>/dev/null || echo "${MODEL:-(default)}")
+
+# === Write Task Metadata ===
+META_FILE="$TASK_DIR/meta.json"
+
+jq -n \
+  --arg task_id "$TASK_ID" \
+  --arg task_name "$TASK_NAME" \
+  --arg started_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+  --arg workdir "$WORKDIR" \
+  --arg adapter "$ADAPTER" \
+  --arg model "$MODEL" \
+  --arg effective_model "$EFFECTIVE_MODEL" \
+  --arg agent_teams "${AGENT_TEAMS:-false}" \
+  --arg callback_session "$CALLBACK_SESSION" \
+  --argjson is_resume "$(if [[ "$RESUME_MODE" == "true" ]]; then echo true; else echo false; fi)" \
+  '{
+    task_id: $task_id,
+    task_name: $task_name,
+    started_at: $started_at,
+    workdir: $workdir,
+    adapter: $adapter,
+    model: $model,
+    effective_model: $effective_model,
+    agent_teams: ($agent_teams == "true"),
+    callback_session: $callback_session,
+    is_resume: $is_resume,
+    status: "running"
+  }' > "$META_FILE"
+
+# === Write launcher script ===
+LAUNCHER="$TASK_DIR/launch.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  # Let adapter set up environment
+  if declare -f get_env > /dev/null 2>&1; then
+    get_env
+  fi
+  echo "cd $(printf '%q' "$WORKDIR")"
+  echo "exec $ADAPTER_CMD"
+} > "$LAUNCHER"
+chmod +x "$LAUNCHER"
+
+# === Launch in background (setsid for full detach) ===
+OUTPUT_FILE="$TASK_DIR/output.txt"
+
+export BG_DISPATCH_TASK_ID="$TASK_ID"
+export BG_DISPATCH_DATA_DIR="$BG_DISPATCH_DATA_DIR"
+
+setsid bash -c '
+  LOCK_FILE="'"$LOCK_FILE"'"
+  META_FILE="'"$META_FILE"'"
+  PROGRESS_DIR="'"$PROGRESS_DIR"'"
+  OUTPUT_FILE="'"$OUTPUT_FILE"'"
+  LAUNCHER="'"$LAUNCHER"'"
+  WORKDIR="'"$WORKDIR"'"
+  TASK_NAME="'"$TASK_NAME"'"
+  ADAPTER="'"$ADAPTER"'"
+
+  cd "$WORKDIR"
+
+  # Run agent with PTY via script wrapper
+  script -q -c "bash $LAUNCHER" /dev/null > "$OUTPUT_FILE" 2>&1
+  EXIT_CODE=$?
+  wait 2>/dev/null || true
+
+  COMPLETED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq --arg code "$EXIT_CODE" --arg ts "$COMPLETED_AT" \
+    ". + {exit_code: (\$code | tonumber), completed_at: \$ts, status: \"done\"}" \
+    "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
+
+  # Update .dev-progress status
+  if [ -f "$PROGRESS_DIR/task-spec.json" ]; then
+    jq --arg ts "$COMPLETED_AT" --arg code "$EXIT_CODE" \
+      ". + {status: \"done\", completed_at: \$ts, exit_code: (\$code | tonumber)}" \
+      "$PROGRESS_DIR/task-spec.json" > "$PROGRESS_DIR/task-spec.json.tmp" \
+      && mv "$PROGRESS_DIR/task-spec.json.tmp" "$PROGRESS_DIR/task-spec.json"
+  fi
+
+  rm -f "$LOCK_FILE"
+
+  # Notify OpenClaw via cron system event (fallback — hook should fire first)
+  sleep 3
+  if command -v openclaw >/dev/null 2>&1; then
+    EFFECTIVE_MODEL=$(jq -r ".effective_model // \"unknown\"" "$META_FILE" 2>/dev/null || echo "unknown")
+    WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME} (${ADAPTER}). Exit: ${EXIT_CODE}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md. Result: ${META_FILE}."
+    FIRE_AT=$(date -u -d "+5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    openclaw cron add \
+      --name "bgd-done-${TASK_NAME}" \
+      --at "$FIRE_AT" \
+      --wake now \
+      --session main \
+      --delete-after-run \
+      --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
+  fi
+' </dev/null &
+
+BG_PID=$!
+
+echo "$BG_PID" > "$LOCK_FILE"
+echo "$BG_PID" > "$TASK_DIR/pid"
+
+# === Launch Watchdog ===
+WATCHDOG_SCRIPT="$BG_DISPATCH_DIR/watchdog.sh"
+if [[ -f "$WATCHDOG_SCRIPT" ]]; then
+  setsid bash "$WATCHDOG_SCRIPT" "$TASK_DIR" "$BG_PID" "$WORKDIR" "$STALL_TIMEOUT" "$MAX_RUNTIME" </dev/null &
+  WATCHDOG_PID=$!
+  disown $WATCHDOG_PID 2>/dev/null || true
+  echo "$WATCHDOG_PID" > "$TASK_DIR/watchdog_pid"
+fi
+
+# === Report ===
+echo "🚀 Task dispatched: $TASK_ID"
+echo "   Adapter:   $ADAPTER"
+echo "   Workdir:   $WORKDIR"
+echo "   Model:     $EFFECTIVE_MODEL"
+echo "   Teams:     $([[ "${AGENT_TEAMS:-}" == "true" ]] && echo "YES" || echo "NO")"
+echo "   Progress:  $PROGRESS_DIR/progress.md"
+echo "   PID:       $BG_PID"
+echo "   Watchdog:  ${WATCHDOG_PID:-(none)} (stall: ${STALL_TIMEOUT}s, max: ${MAX_RUNTIME}s)"
+echo "   Output:    $OUTPUT_FILE"
+echo "   Resume:    $([[ "$RESUME_MODE" == "true" ]] && echo "YES" || echo "NO")"
+echo ""
+echo "Agent running in background. Hook will notify on completion."
+
+exit 0

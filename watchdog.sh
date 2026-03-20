@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+#
+# watchdog.sh — Background watchdog for bg-dispatch tasks.
+#
+# Monitors task for:
+#   - Stall detection (no file changes in workdir)
+#   - Max runtime enforcement
+#   - Process exit detection + fallback notification
+#
+# Usage: watchdog.sh <task_dir> <bg_pid> <workdir> [stall_timeout] [max_runtime]
+#
+
+set -uo pipefail
+
+TASK_DIR="$1"
+BG_PID="$2"
+WORKDIR="$3"
+STALL_TIMEOUT="${4:-900}"
+MAX_RUNTIME="${5:-7200}"
+
+META_FILE="$TASK_DIR/meta.json"
+TASK_NAME=$(jq -r '.task_name // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
+PROGRESS_DIR="$WORKDIR/.dev-progress"
+LOG_FILE="$TASK_DIR/watchdog.log"
+
+# Find lock file
+LOCK_DIR="$(dirname "$TASK_DIR")/../locks"
+LOCK_FILE=""
+if [ -d "$LOCK_DIR" ]; then
+  for lf in "$LOCK_DIR"/*.lock; do
+    [ -f "$lf" ] || continue
+    LOCK_FILE="$lf"
+    break
+  done
+fi
+
+wlog() {
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >> "$LOG_FILE"
+}
+
+wlog "Watchdog started. PID=$BG_PID WORKDIR=$WORKDIR STALL=$STALL_TIMEOUT MAX=$MAX_RUNTIME"
+
+# === Notification helper ===
+trigger_notify() {
+  local REASON="$1"
+  local COMPLETED_AT
+  COMPLETED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # Update meta if still running
+  local CURRENT_STATUS
+  CURRENT_STATUS=$(jq -r '.status // ""' "$META_FILE" 2>/dev/null || echo "")
+  if [ "$CURRENT_STATUS" = "running" ]; then
+    jq --arg ts "$COMPLETED_AT" --arg reason "$REASON" \
+      '. + {completed_at: $ts, status: "done", completion_trigger: $reason}' \
+      "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
+  fi
+
+  sleep 3
+
+  # Wake OpenClaw
+  if command -v openclaw >/dev/null 2>&1; then
+    local EFFECTIVE_MODEL
+    EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
+    local STARTED_AT
+    STARTED_AT=$(jq -r '.started_at // ""' "$META_FILE" 2>/dev/null || echo "")
+
+    local WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Duration: ${STARTED_AT} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md."
+    local FIRE_AT
+    FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    openclaw cron add \
+      --name "bgd-done-${TASK_NAME}" \
+      --at "$FIRE_AT" \
+      --wake now \
+      --session main \
+      --delete-after-run \
+      --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
+    wlog "OpenClaw notified ($REASON)"
+  fi
+
+  [ -n "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
+}
+
+# === Main loop ===
+START_TIME=$(date +%s)
+LAST_ACTIVITY=$(date +%s)
+
+while true; do
+  sleep 15
+
+  # Process exited?
+  if ! kill -0 $BG_PID 2>/dev/null; then
+    wlog "Process $BG_PID exited. Waiting for hook..."
+    sleep 35  # Give hook time to fire
+
+    CURRENT_STATUS=$(jq -r '.status // ""' "$META_FILE" 2>/dev/null || echo "")
+    if [ "$CURRENT_STATUS" = "running" ]; then
+      wlog "Hook didn't fire. Sending fallback notification."
+      trigger_notify "watchdog_fallback"
+    else
+      # Double-check cron was sent
+      COMPLETION_TRIGGER=$(jq -r '.completion_trigger // ""' "$META_FILE" 2>/dev/null || echo "")
+      if [ -z "$COMPLETION_TRIGGER" ]; then
+        wlog "Hook set status but may not have sent cron. Safety net."
+        trigger_notify "watchdog_safety_net"
+      else
+        wlog "Hook handled notification."
+      fi
+    fi
+    break
+  fi
+
+  NOW=$(date +%s)
+
+  # Max runtime check
+  ELAPSED=$((NOW - START_TIME))
+  if [ "$ELAPSED" -ge "$MAX_RUNTIME" ]; then
+    wlog "Max runtime (${MAX_RUNTIME}s) exceeded. Killing."
+    kill -TERM $BG_PID 2>/dev/null || true
+    jq --arg reason "max_runtime_exceeded" '. + {status: "killed", kill_reason: $reason}' \
+      "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
+    trigger_notify "max_runtime_exceeded"
+    break
+  fi
+
+  # Activity check
+  RECENT=$(find "$WORKDIR" -not -path "*/.git/*" -newer "$TASK_DIR/pid" -type f 2>/dev/null | head -1)
+  if [ -n "$RECENT" ]; then
+    LAST_ACTIVITY=$NOW
+    touch "$TASK_DIR/pid"
+  fi
+
+  # Progress.md completion check
+  PROGRESS_FILE="$PROGRESS_DIR/progress.md"
+  if [ -f "$PROGRESS_FILE" ]; then
+    PROGRESS_STATUS=$(grep -m1 '^## Status:' "$PROGRESS_FILE" 2>/dev/null | sed 's/^## Status: *//' | tr '[:lower:]' '[:upper:]' || echo "")
+    if [ "$PROGRESS_STATUS" = "COMPLETE" ] || [ "$PROGRESS_STATUS" = "DONE" ]; then
+      wlog "Task marked COMPLETE in progress.md."
+      kill -TERM $BG_PID 2>/dev/null || true
+      trigger_notify "progress_complete"
+      break
+    fi
+  fi
+
+  # Stall check
+  IDLE=$((NOW - LAST_ACTIVITY))
+  if [ "$IDLE" -ge "$STALL_TIMEOUT" ]; then
+    wlog "Stalled for ${IDLE}s (limit: ${STALL_TIMEOUT}s). Killing."
+    kill -TERM $BG_PID 2>/dev/null || true
+    jq --arg reason "stall_detected" --arg idle "$IDLE" \
+      '. + {status: "killed", kill_reason: $reason, idle_seconds: ($idle | tonumber)}' \
+      "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
+    if [ -f "$PROGRESS_DIR/task-spec.json" ]; then
+      jq '. + {status: "stalled", needs_review: true}' \
+        "$PROGRESS_DIR/task-spec.json" > "$PROGRESS_DIR/task-spec.json.tmp" \
+        && mv "$PROGRESS_DIR/task-spec.json.tmp" "$PROGRESS_DIR/task-spec.json"
+    fi
+    trigger_notify "stall_detected"
+    break
+  fi
+done
+
+wlog "Watchdog exiting."
