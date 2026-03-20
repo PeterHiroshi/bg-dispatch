@@ -22,6 +22,7 @@ META_FILE="$TASK_DIR/meta.json"
 TASK_NAME=$(jq -r '.task_name // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
 PROGRESS_DIR="$WORKDIR/.dev-progress"
 LOG_FILE="$TASK_DIR/watchdog.log"
+BG_DISPATCH_DIR="${BG_DISPATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 # Find lock file
 LOCK_DIR="$(dirname "$TASK_DIR")/../locks"
@@ -57,25 +58,22 @@ trigger_notify() {
 
   sleep 3
 
-  # Wake OpenClaw
-  if command -v openclaw >/dev/null 2>&1; then
-    local EFFECTIVE_MODEL
-    EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
-    local STARTED_AT
-    STARTED_AT=$(jq -r '.started_at // ""' "$META_FILE" 2>/dev/null || echo "")
-
-    local WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Duration: ${STARTED_AT} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md."
-    local FIRE_AT
-    FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    openclaw cron add \
-      --name "bgd-done-${TASK_NAME}" \
-      --at "$FIRE_AT" \
-      --wake now \
-      --session main \
-      --delete-after-run \
-      --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
-    wlog "OpenClaw notified ($REASON)"
+  # Dispatch via notifier system
+  NOTIFY_SCRIPT="$BG_DISPATCH_DIR/notify.sh"
+  if [ -f "$NOTIFY_SCRIPT" ]; then
+    bash "$NOTIFY_SCRIPT" "$META_FILE" >> "$LOG_FILE" 2>&1 || true
+    wlog "Notifications dispatched ($REASON)"
+  else
+    # Fallback: direct openclaw cron
+    if command -v openclaw >/dev/null 2>&1; then
+      local EFFECTIVE_MODEL STARTED_AT_VAL WAKE_TEXT FIRE_AT
+      EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
+      STARTED_AT_VAL=$(jq -r '.started_at // ""' "$META_FILE" 2>/dev/null || echo "")
+      WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Duration: ${STARTED_AT_VAL} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md."
+      FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+      openclaw cron add --name "bgd-done-${TASK_NAME}" --at "$FIRE_AT" --wake now --session main --delete-after-run --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
+      wlog "Fallback: OpenClaw notified directly ($REASON)"
+    fi
   fi
 
   [ -n "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
@@ -98,10 +96,9 @@ while true; do
       wlog "Hook didn't fire. Sending fallback notification."
       trigger_notify "watchdog_fallback"
     else
-      # Double-check cron was sent
       COMPLETION_TRIGGER=$(jq -r '.completion_trigger // ""' "$META_FILE" 2>/dev/null || echo "")
       if [ -z "$COMPLETION_TRIGGER" ]; then
-        wlog "Hook set status but may not have sent cron. Safety net."
+        wlog "Hook set status but may not have sent notification. Safety net."
         trigger_notify "watchdog_safety_net"
       else
         wlog "Hook handled notification."

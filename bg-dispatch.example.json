@@ -1,0 +1,10 @@
+{
+  "notifiers": [
+    {
+      "type": "openclaw",
+      "config": {
+        "session": "main"
+      }
+    }
+  ]
+}

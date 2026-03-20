@@ -2,34 +2,34 @@
 
 **Fire-and-forget background dispatch for heavy coding agents.**
 
-Launch tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-code), Aider, or any long-running coding CLI in the background. Your [OpenClaw](https://github.com/openclaw/openclaw) session stays free — zero tokens consumed while the agent works. When it's done, a hook callback wakes OpenClaw automatically.
+Launch tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Aider](https://aider.chat), [Codex CLI](https://github.com/openai/codex), or any long-running coding CLI in the background. Your [OpenClaw](https://github.com/openclaw/openclaw) session stays free — zero tokens consumed while the agent works. When it's done, pluggable notifiers wake your agent and alert your team.
 
 ## The Problem
 
-Heavy "vibe coding" tools (Claude Code, Cursor Agent, Aider) can run for minutes to hours. If your AI assistant waits for them to finish, it's blocked — burning tokens on polling or sitting idle. You can't talk to it, and it can't help you with anything else.
+Heavy "vibe coding" tools can run for minutes to hours. If your AI assistant waits for them to finish, it's blocked — burning tokens on polling or sitting idle. You can't talk to it, and it can't help you with anything else.
 
 ## The Solution
 
 ```
-You (chat) → OpenClaw → bg-dispatch → Claude Code (background)
+You (chat) → OpenClaw → bg-dispatch → Coding Agent (background)
                 ↑                              │
-                └──── hook callback ────────────┘
+                └──── pluggable notifiers ──────┘
                      (zero wait, zero poll)
 ```
 
 1. **Dispatch** — `bg-dispatch` launches the coding agent in the background and returns immediately
-2. **Work** — The coding agent runs independently, tracking progress in `.dev-progress/`
-3. **Callback** — On completion, a hook fires and wakes OpenClaw via `openclaw cron add --system-event`
-4. **Resume** — If interrupted (container reset, crash), the agent can resume from `.dev-progress/`
+2. **Work** — The agent runs independently, tracking progress in `.dev-progress/`
+3. **Notify** — On completion, pluggable notifiers wake OpenClaw + alert your team (Slack, Feishu, Discord, etc.)
+4. **Resume** — If interrupted (container reset, crash), the agent resumes from `.dev-progress/`
 
 ## Features
 
-- 🚀 **Fire-and-forget** — Main session freed instantly, zero token burn while agent works
-- 🔔 **Hook callback** — Agent completion wakes OpenClaw via cron system event
-- 🔄 **Resumable** — `.dev-progress/` tracks progress; survives crashes and container resets
-- 🐕 **Watchdog** — Auto-kills stalled tasks (no file changes) and enforces max runtime
+- 🚀 **Fire-and-forget** — Main session freed instantly, zero token burn
+- 🔔 **Pluggable notifications** — OpenClaw wake, Slack, Feishu, Discord, custom commands
+- 🔌 **Adapter pattern** — Claude Code, Aider, Codex CLI built-in; add your own easily
+- 🔄 **Resumable** — `.dev-progress/` survives crashes and container resets
+- 🐕 **Watchdog** — Auto-kills stalled tasks, enforces max runtime
 - 🔒 **Workdir locking** — Prevents duplicate agents on the same project
-- 🔌 **Adapter pattern** — Ships with Claude Code adapter; extensible to any CLI agent
 
 ## Quick Start
 
@@ -39,99 +39,184 @@ You (chat) → OpenClaw → bg-dispatch → Claude Code (background)
 git clone https://github.com/PeterHiroshi/bg-dispatch.git
 cd bg-dispatch
 bash install.sh
+export PATH="$(pwd):$PATH"
 ```
 
-This installs the hook into `~/.claude/hooks/` and configures Claude Code to call back on completion.
+### 2. Configure Notifications
 
-### 2. Dispatch a Task
+Create `bg-dispatch.json`:
+
+```json
+{
+  "notifiers": [
+    { "type": "openclaw", "config": { "session": "main" } },
+    { "type": "webhook",  "config": { "url_env": "SLACK_WEBHOOK_URL", "template": "slack" } }
+  ]
+}
+```
+
+### 3. Dispatch a Task
 
 ```bash
 bg-dispatch \
   --adapter claude-code \
-  --prompt "Build a REST API with user auth" \
+  --prompt "Build a REST API with user auth and rate limiting" \
   --name "user-auth-api" \
   --workdir /path/to/project
 ```
 
-The script returns immediately. Claude Code runs in the background.
+Returns immediately. Your session is free.
 
-### 3. Get Notified
+### 4. Get Notified
 
-When the task completes, OpenClaw receives a system event:
+When complete, OpenClaw receives a system event and Slack gets a rich notification:
 
 ```
-🔨 Task done: user-auth-api. Duration: 12m34s. Workdir: /path/to/project.
-Read .dev-progress/progress.md for details.
+✅ bg-dispatch: user-auth-api
+Status: done (exit 0)  |  Duration: 23m41s
+Model: claude-opus-4-1  |  Project: my-api
 ```
 
-Your OpenClaw agent can then read the progress, create a PR, notify you — whatever you've configured.
-
-### 4. Resume After Interruption
+### 5. Resume After Interruption
 
 ```bash
-bg-dispatch --adapter claude-code --workdir /path/to/project --resume
+bg-dispatch --adapter claude-code --workdir /path/to/project --resume --force
 ```
 
-The agent reads `.dev-progress/progress.md` and `git log`, then picks up where it left off.
+## Adapters
+
+| Adapter | Tool | Status |
+|---------|------|--------|
+| `claude-code` | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | ✅ Built-in |
+| `aider` | [Aider](https://aider.chat) | ✅ Built-in |
+| `codex` | [Codex CLI](https://github.com/openai/codex) | ✅ Built-in |
+| Custom | Your tool | 📝 [Write an adapter](docs/writing-adapters.md) |
+
+### Claude Code
+
+```bash
+bg-dispatch -a claude-code \
+  -p "Implement Stripe payment module" \
+  -n "payments" -w ./project \
+  --agent-teams --model "claude-opus-4-1-20250805"
+```
+
+### Aider
+
+```bash
+bg-dispatch -a aider \
+  -p "Refactor DB layer for connection pooling" \
+  -n "db-refactor" -w ./project \
+  --opt test-cmd="pytest" --opt lint-cmd="ruff check"
+```
+
+### Codex CLI
+
+```bash
+bg-dispatch -a codex \
+  -p "Add test coverage for auth module" \
+  -n "auth-tests" -w ./project
+```
+
+## Notification System
+
+### Built-in Notifiers
+
+| Notifier | Description | Config |
+|----------|-------------|--------|
+| `openclaw` | Wake OpenClaw session via cron | `session` |
+| `webhook` | POST to Slack/Feishu/Discord/any URL | `url` or `url_env`, `template` |
+| `command` | Run any shell command | `command`, `timeout` |
+
+### Webhook Templates
+
+```json
+{ "type": "webhook", "config": { "url_env": "SLACK_WEBHOOK_URL", "template": "slack" } }
+{ "type": "webhook", "config": { "url_env": "FEISHU_WEBHOOK_URL", "template": "feishu" } }
+{ "type": "webhook", "config": { "url_env": "DISCORD_WEBHOOK_URL", "template": "discord" } }
+{ "type": "webhook", "config": { "url": "https://example.com/hook", "template": "generic" } }
+```
+
+### Custom Command Notifier
+
+```json
+{
+  "type": "command",
+  "config": {
+    "command": "curl -X POST https://my-api.com/tasks -d '{\"task\": \"'$BGD_TASK_NAME'\", \"status\": \"'$BGD_STATUS'\"}'",
+    "timeout": 30
+  }
+}
+```
+
+Environment variables available in commands:
+`BGD_TASK_NAME`, `BGD_STATUS`, `BGD_EXIT_CODE`, `BGD_WORKDIR`, `BGD_MODEL`, `BGD_ADAPTER`, `BGD_STARTED_AT`, `BGD_COMPLETED_AT`, `BGD_META_FILE`, `BGD_PROGRESS_FILE`
+
+### Writing Custom Notifiers
+
+Create a script in `notifiers/` with two functions:
+
+```bash
+# notifiers/my-notifier.sh
+notifier_validate() { ... }
+notifier_send() {
+  local META_FILE="$1" CONFIG="$2"
+  # Read task info from META_FILE, send notification
+}
+```
+
+Then add to `bg-dispatch.json`:
+```json
+{ "type": "my-notifier", "config": { ... } }
+```
+
+### Config File Locations
+
+Searched in order (first found wins):
+1. `<workdir>/bg-dispatch.json` — per-project
+2. `<data-dir>/bg-dispatch.json` — instance
+3. `<install-dir>/bg-dispatch.json` — global
+4. `~/.bg-dispatch.json` — user home
 
 ## Architecture
 
 ```
 bg-dispatch (orchestrator)
-├── adapters/
-│   ├── claude-code.sh      # Claude Code adapter (ships built-in)
-│   └── (your-adapter.sh)   # Add your own
+├── adapters/          # Agent launchers
+│   ├── claude-code.sh
+│   ├── aider.sh
+│   └── codex.sh
+├── notifiers/         # Pluggable notifications
+│   ├── openclaw.sh    # Wake OpenClaw session
+│   ├── webhook.sh     # Slack/Feishu/Discord/generic
+│   └── command.sh     # Custom commands
 ├── hooks/
-│   ├── on-complete.sh      # Fires on task completion → wakes OpenClaw
-│   └── settings.json       # Claude Code hook config
-├── watchdog.sh              # Monitors for stalls + max runtime
-├── task-check.mjs           # Heartbeat integration for OpenClaw agents
-└── data/tasks/              # Runtime task metadata (gitignored)
+│   └── on-complete.sh # Claude Code Stop hook → notify.sh
+├── notify.sh          # Notification dispatcher
+├── watchdog.sh        # Stall detection + max runtime
+└── task-check.mjs     # Heartbeat integration
+```
 
-Per-project:
+### Notification Flow (Three-Layer Guarantee)
+
+```
+Agent completes
+  ├─→ Hook fires (primary) ──→ notify.sh ──→ [openclaw, webhook, command, ...]
+  ├─→ Process fallback ─────→ notify.sh
+  └─→ Watchdog (safety net) → notify.sh  (if hook + fallback both miss)
+```
+
+### Progress Tracking
+
+Each task creates `.dev-progress/` in the workdir:
+
+```
 <workdir>/.dev-progress/
-├── task-spec.json           # Task definition (for resume)
-└── progress.md              # Progress tracker (agent maintains this)
+├── task-spec.json   # Task definition (prompt, adapter, config)
+└── progress.md      # Living progress doc (agent updates this)
 ```
 
-### Adapter Pattern
-
-Each coding agent gets an adapter — a shell script that knows how to:
-1. **Launch** the agent in background with the right flags
-2. **Build** the command from bg-dispatch's generic options
-3. **Detect** completion (exit code, output file)
-
-```bash
-# adapters/claude-code.sh — simplified
-build_command() {
-  CMD=("$CLAUDE_BIN" -p "$PROMPT" --allowedTools "$ALLOWED_TOOLS")
-  [[ -n "$MODEL" ]] && CMD+=(--model "$MODEL")
-  echo "${CMD[@]}"
-}
-```
-
-To add a new adapter (e.g., for Aider), create `adapters/aider.sh` implementing `build_command()` and `get_env()`. See [Writing Adapters](docs/writing-adapters.md) for the full interface.
-
-### Hook Mechanism
-
-bg-dispatch uses Claude Code's native hook system (`~/.claude/hooks/`). When Claude Code's session ends:
-
-1. **Stop hook** fires → `hooks/on-complete.sh` reads task metadata
-2. Hook verifies the process actually exited (retries up to 30s to handle race conditions)
-3. Hook writes `result.json` with output summary
-4. Hook calls `openclaw cron add --system-event "..."` to wake the main session
-5. **Watchdog** provides backup notification if the hook fails
-
-This is a push-based notification — no polling, no token waste.
-
-### Watchdog
-
-A background watchdog process monitors each dispatched task:
-
-- **Stall detection** — If no files change in the workdir for 15 minutes (configurable), the task is killed
-- **Max runtime** — Hard limit of 2 hours (configurable) to prevent runaway agents
-- **Fallback notification** — If the hook doesn't fire, the watchdog sends the completion notification
-- **Exit detection** — Watches for process exit and triggers notification after a grace period
+This enables **resumability**: if the container resets, `--resume` reads these files and the agent picks up where it left off.
 
 ## Configuration
 
@@ -139,83 +224,58 @@ A background watchdog process monitors each dispatched task:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BG_DISPATCH_DIR` | Script location | Base directory for bg-dispatch |
-| `BG_DISPATCH_DATA_DIR` | `$BG_DISPATCH_DIR/data` | Runtime task data |
-| `BG_DISPATCH_STALL_TIMEOUT` | `900` (15 min) | Seconds of inactivity before killing |
-| `BG_DISPATCH_MAX_RUNTIME` | `7200` (2 hours) | Maximum total runtime in seconds |
+| `BG_DISPATCH_DIR` | Script location | Base directory |
+| `BG_DISPATCH_DATA_DIR` | `$BG_DISPATCH_DIR/data` | Runtime data |
+| `BG_DISPATCH_STALL_TIMEOUT` | `900` (15 min) | Inactivity kill threshold |
+| `BG_DISPATCH_MAX_RUNTIME` | `7200` (2 hours) | Maximum total runtime |
 
-### Claude Code Adapter Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_BIN` | `/usr/local/bin/claude` | Path to Claude Code binary |
-| `CLAUDE_CODE_USE_BEDROCK` | — | Set to `1` for AWS Bedrock auth |
-| `AWS_PROFILE` | — | AWS profile for Bedrock |
-
-## CLI Reference
+### CLI Reference
 
 ```
-Usage: bg-dispatch [OPTIONS]
+bg-dispatch [OPTIONS]
+
+Required:
+  -a, --adapter NAME         Adapter (claude-code, aider, codex)
+  -p, --prompt TEXT          Task prompt (unless --resume)
 
 Options:
-  -a, --adapter NAME         Adapter to use (e.g., claude-code) [required]
-  -p, --prompt TEXT          Task prompt [required unless --resume]
-  -n, --name NAME            Task name for tracking [default: task-<timestamp>]
+  -n, --name NAME            Task name [default: task-<timestamp>]
   -w, --workdir DIR          Working directory [default: cwd]
-  --resume                   Resume interrupted task from .dev-progress/
-  --force                    Kill existing task for same workdir
-  --model MODEL              Model override (adapter-specific)
-  --allowed-tools TOOLS      Allowed tools list (adapter-specific)
-  --agent-teams              Enable multi-agent mode (adapter-specific)
-  --stall-timeout SECS       Override stall detection timeout
-  --max-runtime SECS         Override maximum runtime
-  --callback-session KEY     OpenClaw session key to wake on completion
-  -h, --help                 Show help
+  --resume                   Resume from .dev-progress/
+  --force                    Kill existing task for workdir
+  --model MODEL              Model override
+  --allowed-tools TOOLS      Allowed tools (adapter-specific)
+  --agent-teams              Enable multi-agent mode
+  --stall-timeout SECS       Stall timeout [default: 900]
+  --max-runtime SECS         Max runtime [default: 7200]
+  --callback-session KEY     OpenClaw session key
+  --opt KEY=VALUE            Adapter-specific option (repeatable)
 ```
 
-## OpenClaw Integration
+## OpenClaw Skill Integration
 
-bg-dispatch is designed as an [OpenClaw Skill](https://docs.openclaw.ai/skills). Your OpenClaw agent can:
-
-1. **Dispatch** tasks when users request development work
-2. **Resume** interrupted tasks during heartbeat checks
-3. **Monitor** task status via `task-check.mjs`
-4. **Notify** users when tasks complete (via any configured channel)
-
-### Heartbeat Integration
-
-```javascript
-// In your OpenClaw agent's heartbeat:
-// 1. Run task-check.mjs to find completed/interrupted tasks
-// 2. Handle results (notify user, create PR, resume interrupted tasks)
-```
-
-### As an OpenClaw Skill
-
-Copy or symlink into your OpenClaw workspace skills directory:
+bg-dispatch works as a standalone tool or as an [OpenClaw Skill](https://docs.openclaw.ai/skills):
 
 ```bash
+# Symlink into your workspace
 ln -s /path/to/bg-dispatch ~/.openclaw/workspace/skills/bg-dispatch
 ```
 
-Then reference it in your agent's workflow. See [SKILL.md](SKILL.md) for the full skill definition.
-
-## Writing Adapters
-
-See [docs/writing-adapters.md](docs/writing-adapters.md) for the adapter interface specification. In summary, an adapter script must export two functions:
-
-- `build_command()` — Returns the CLI command array to launch the agent
-- `get_env()` — Returns any environment variables the agent needs
+See [SKILL.md](SKILL.md) for the full skill definition with agent-oriented instructions.
 
 ## Roadmap
 
+- [x] Core dispatcher with adapter pattern
 - [x] Claude Code adapter
-- [ ] Aider adapter
-- [ ] Cursor Agent adapter (when CLI available)
-- [ ] Codex CLI adapter
-- [ ] Multi-task parallel dispatch
+- [x] Aider adapter
+- [x] Codex CLI adapter
+- [x] Pluggable notification system (OpenClaw, Slack, Feishu, Discord, custom)
+- [x] Watchdog with three-layer notification guarantee
+- [x] Resume support via `.dev-progress/`
+- [ ] Cursor Agent adapter (when headless CLI available)
 - [ ] Web dashboard for task monitoring
-- [ ] OpenClaw Skill marketplace listing
+- [ ] OpenClaw Skill marketplace listing (ClawhHub)
+- [ ] Multi-task parallel dispatch orchestration
 
 ## License
 

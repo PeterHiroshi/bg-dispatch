@@ -4,12 +4,13 @@
 #
 # Installed to ~/.claude/hooks/on-complete.sh
 # Fires when Claude Code finishes a generation. Checks if the process
-# actually exited, then writes result.json and wakes OpenClaw.
+# actually exited, then writes result.json and dispatches notifications.
 #
 
 set -uo pipefail
 
-BG_DISPATCH_DATA_DIR="${BG_DISPATCH_DATA_DIR:-$HOME/.bg-dispatch/data}"
+BG_DISPATCH_DIR="${BG_DISPATCH_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd 2>/dev/null || echo "$HOME/.bg-dispatch")}"
+BG_DISPATCH_DATA_DIR="${BG_DISPATCH_DATA_DIR:-$BG_DISPATCH_DIR/data}"
 LOG_FILE="$BG_DISPATCH_DATA_DIR/hook.log"
 LOCK_AGE_LIMIT=30
 
@@ -96,8 +97,7 @@ log "Process confirmed exited, sending notification"
 STARTED_AT=$(jq -r '.started_at // ""' "$META_FILE" 2>/dev/null || echo "")
 WORKDIR=$(jq -r '.workdir // ""' "$META_FILE" 2>/dev/null || echo "")
 
-# Wait for output flush
-sleep 2
+sleep 2  # wait for output flush
 
 # Capture output summary
 OUTPUT_SUMMARY=""
@@ -131,20 +131,20 @@ jq --arg ts "$COMPLETED_AT" '. + {completed_at: $ts, status: "done", completion_
 
 log "Result written: $RESULT_FILE"
 
-# Wake OpenClaw
-if command -v openclaw >/dev/null 2>&1; then
-  EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
-  WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Duration: ${STARTED_AT} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md. Result: ${RESULT_FILE}."
-  FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-
-  openclaw cron add \
-    --name "bgd-done-${TASK_NAME}" \
-    --at "$FIRE_AT" \
-    --wake now \
-    --session main \
-    --delete-after-run \
-    --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
-  log "OpenClaw notified via cron"
+# === Dispatch notifications via notifier system ===
+NOTIFY_SCRIPT="$BG_DISPATCH_DIR/notify.sh"
+if [ -f "$NOTIFY_SCRIPT" ]; then
+  bash "$NOTIFY_SCRIPT" "$META_FILE" >> "$LOG_FILE" 2>&1 || true
+  log "Notifications dispatched via notify.sh"
+else
+  # Fallback: direct openclaw cron (backwards compat)
+  if command -v openclaw >/dev/null 2>&1; then
+    EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
+    WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md."
+    FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    openclaw cron add --name "bgd-done-${TASK_NAME}" --at "$FIRE_AT" --wake now --session main --delete-after-run --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
+    log "Fallback: OpenClaw notified directly"
+  fi
 fi
 
 log "=== Hook completed ==="

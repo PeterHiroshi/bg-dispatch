@@ -378,9 +378,12 @@ setsid bash -c '
 
   rm -f "$LOCK_FILE"
 
-  # Notify OpenClaw via cron system event (fallback — hook should fire first)
+  # Dispatch notifications via notifier system (fallback — hook should fire first)
   sleep 3
-  if command -v openclaw >/dev/null 2>&1; then
+  NOTIFY_SCRIPT="'"$BG_DISPATCH_DIR"'/notify.sh"
+  if [ -f "$NOTIFY_SCRIPT" ]; then
+    bash "$NOTIFY_SCRIPT" "$META_FILE" 2>/dev/null || true
+  elif command -v openclaw >/dev/null 2>&1; then
     EFFECTIVE_MODEL=$(jq -r ".effective_model // \"unknown\"" "$META_FILE" 2>/dev/null || echo "unknown")
     WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME} (${ADAPTER}). Exit: ${EXIT_CODE}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md. Result: ${META_FILE}."
     FIRE_AT=$(date -u -d "+5 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
