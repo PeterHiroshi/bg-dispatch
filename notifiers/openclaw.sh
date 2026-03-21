@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# openclaw.sh — bg-dispatch notifier: OpenClaw cron system event
+# openclaw.sh — bg-dispatch notifier: OpenClaw direct system event
 #
-# Wakes the OpenClaw main session via `openclaw cron add --system-event`.
+# Wakes the OpenClaw main session via `openclaw system event --mode now`.
 # This is the primary notification path for OpenClaw-based setups.
 #
 # Config keys (in bg-dispatch.json notifiers[].config):
@@ -47,18 +47,13 @@ notifier_send() {
   local STATUS
   STATUS=$(jq -r '.status // "unknown"' "$META_FILE")
 
-  local WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME} (${ADAPTER}). Status: ${STATUS}. Exit: ${EXIT_CODE}. Duration: ${STARTED_AT} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md. Result: ${META_FILE}."
+  # Derive task dir from meta file path for progress reference
+  local TASK_DIR
+  TASK_DIR="$(dirname "$META_FILE")"
 
-  local FIRE_AT
-  FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+  local WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME} (${ADAPTER}). Status: ${STATUS}. Exit: ${EXIT_CODE}. Duration: ${STARTED_AT} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${TASK_DIR}/progress.md. Result: ${META_FILE}."
 
-  openclaw cron add \
-    --name "bgd-done-${TASK_NAME}" \
-    --at "$FIRE_AT" \
-    --wake now \
-    --session "$SESSION" \
-    --delete-after-run \
-    --system-event "$WAKE_TEXT" >/dev/null 2>&1
+  openclaw system event --mode now --text "$WAKE_TEXT" >/dev/null 2>&1
 
   echo "[openclaw-notifier] Sent to session=$SESSION" >&2
 }
