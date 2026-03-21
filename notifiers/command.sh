@@ -43,7 +43,7 @@ notifier_send() {
   export BGD_STARTED_AT=$(jq -r '.started_at // ""' "$META_FILE")
   export BGD_COMPLETED_AT=$(jq -r '.completed_at // ""' "$META_FILE")
   export BGD_META_FILE="$META_FILE"
-  export BGD_PROGRESS_FILE="${BGD_WORKDIR}/.dev-progress/progress.md"
+  export BGD_PROGRESS_FILE="$(dirname "$META_FILE")/progress.md"
 
   timeout "$TIMEOUT" bash -c "$CMD" 2>&1 || {
     echo "[command-notifier] Command failed or timed out (${TIMEOUT}s)" >&2
