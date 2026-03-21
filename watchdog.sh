@@ -20,7 +20,8 @@ MAX_RUNTIME="${5:-7200}"
 
 META_FILE="$TASK_DIR/meta.json"
 TASK_NAME=$(jq -r '.task_name // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
-PROGRESS_DIR="$WORKDIR/.dev-progress"
+# Progress is centralized in the task directory (not workdir/.dev-progress/)
+PROGRESS_DIR="$TASK_DIR"
 LOG_FILE="$TASK_DIR/watchdog.log"
 BG_DISPATCH_DIR="${BG_DISPATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
@@ -69,9 +70,8 @@ trigger_notify() {
       local EFFECTIVE_MODEL STARTED_AT_VAL WAKE_TEXT FIRE_AT
       EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
       STARTED_AT_VAL=$(jq -r '.started_at // ""' "$META_FILE" 2>/dev/null || echo "")
-      WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Duration: ${STARTED_AT_VAL} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md."
-      FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-      openclaw cron add --name "bgd-done-${TASK_NAME}" --at "$FIRE_AT" --wake now --session main --delete-after-run --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
+      WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Duration: ${STARTED_AT_VAL} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${TASK_DIR}/progress.md."
+      openclaw system event --mode now --text "$WAKE_TEXT" >/dev/null 2>&1 || true
       wlog "Fallback: OpenClaw notified directly ($REASON)"
     fi
   fi
@@ -147,10 +147,11 @@ while true; do
     jq --arg reason "stall_detected" --arg idle "$IDLE" \
       '. + {status: "killed", kill_reason: $reason, idle_seconds: ($idle | tonumber)}' \
       "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
-    if [ -f "$PROGRESS_DIR/task-spec.json" ]; then
-      jq '. + {status: "stalled", needs_review: true}' \
-        "$PROGRESS_DIR/task-spec.json" > "$PROGRESS_DIR/task-spec.json.tmp" \
-        && mv "$PROGRESS_DIR/task-spec.json.tmp" "$PROGRESS_DIR/task-spec.json"
+    # Update meta.json with stall info (centralized in task dir)
+    if [ -f "$TASK_DIR/meta.json" ]; then
+      jq '. + {needs_review: true}' \
+        "$TASK_DIR/meta.json" > "$TASK_DIR/meta.json.stall.tmp" \
+        && mv "$TASK_DIR/meta.json.stall.tmp" "$TASK_DIR/meta.json"
     fi
     trigger_notify "stall_detected"
     break

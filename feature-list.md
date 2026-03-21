@@ -23,11 +23,22 @@
 
 | # | Feature | Status | Branch | Notes |
 |---|---------|--------|--------|-------|
-| 7 | `bgd progress <task>` — show .dev-progress/progress.md from workdir | 🟢 | feature/bgd-cli | Read live progress from the actual workdir |
+| 7 | `bgd progress <task>` — show progress.md from task data directory | 🟢 | feature/bgd-cli | Read live progress from centralized data/tasks/ |
 | 8 | `bgd cancel <task>` — cancel a running task | 🟢 | feature/bgd-cli | Kill process tree, update meta, notify |
 | 9 | `bgd resume <task>` — resume an interrupted task | 🟢 | feature/bgd-cli | Wrapper around bg-dispatch --resume --force |
 
-### Phase 3 — SKILL.md Integration
+### Phase 3 — Architecture Improvements
+
+| # | Feature | Status | Branch | Notes |
+|---|---------|--------|--------|-------|
+| 13 | Centralize progress tracking — move from .dev-progress/ in workdir to data/tasks/<task-id>/ | 🟢 | feature/centralize-progress | Avoids polluting project repos (especially open-source). Progress.md + meta.json all in data/tasks/ |
+| 14 | Replace cron-based wake with direct system event — `openclaw system event --mode now` | 🟢 | feature/centralize-progress | Instant wake, no unnecessary cron job creation, removes 5s delay |
+| 15 | Update bgd CLI to read progress from data/tasks/ instead of .dev-progress/ | 🟢 | feature/centralize-progress | bgd progress, bgd show must use new centralized paths |
+| 16 | Update SKILL.md, README.md, CLAUDE.md to reflect new architecture | 🟢 | feature/centralize-progress | All docs must describe centralized progress + direct system event |
+| 17 | Update task-check.mjs for centralized progress paths | 🟢 | feature/centralize-progress | Heartbeat integration uses data/tasks/ |
+| 18 | Backward compatibility — detect and migrate legacy .dev-progress/ | 🟢 | feature/centralize-progress | Resume mode should check both locations |
+
+### Phase 4 — SKILL.md Integration (completed)
 
 | # | Feature | Status | Branch | Notes |
 |---|---------|--------|--------|-------|

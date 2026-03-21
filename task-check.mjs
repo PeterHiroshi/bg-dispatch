@@ -9,7 +9,7 @@
  *
  * Output: JSON object with arrays of tasks needing attention:
  *   - unnotified: completed tasks not yet acknowledged
- *   - interrupted: tasks in .dev-progress/ with no running process
+ *   - interrupted: tasks in data/tasks/ with no running process
  *   - stalled: running tasks with no recent file activity
  */
 
@@ -67,21 +67,24 @@ if (existsSync(tasksDir)) {
   }
 }
 
-// Check interrupted tasks
+// Check interrupted tasks (centralized in data/tasks/)
 const interrupted = [];
 const agentRunning = isAgentRunning();
 
-if (!agentRunning && projectsDir && existsSync(projectsDir)) {
-  for (const dir of readdirSync(projectsDir, { withFileTypes: true })) {
+if (!agentRunning && existsSync(tasksDir)) {
+  for (const dir of readdirSync(tasksDir, { withFileTypes: true })) {
     if (!dir.isDirectory()) continue;
-    const specPath = join(projectsDir, dir.name, ".dev-progress", "task-spec.json");
-    const spec = readJson(specPath);
-    if (!spec || spec.status !== "in_progress") continue;
+    const metaPath = join(tasksDir, dir.name, "meta.json");
+    const meta = readJson(metaPath);
+    if (!meta) continue;
+    // A task is "interrupted" if it was running but the agent is no longer active
+    if (meta.status !== "running") continue;
 
     interrupted.push({
-      task_name: spec.task_name || "unknown",
-      needs_review: spec.needs_review || false,
-      spec_path: specPath,
+      task_name: meta.task_name || "unknown",
+      needs_review: meta.needs_review || false,
+      meta_path: metaPath,
+      workdir: meta.workdir || "",
     });
   }
 }
