@@ -136,7 +136,7 @@ bg-dispatch uses a pluggable notifier system. Configure in `bg-dispatch.json`:
 
 | Type | Description | Use Case |
 |------|-------------|----------|
-| `openclaw` | Wakes OpenClaw session via cron system event | Primary — agent receives completion event |
+| `openclaw` | Wakes OpenClaw session via direct system event | Primary — agent receives completion event |
 | `webhook` | HTTP POST to any webhook URL | Team notifications (Slack, Feishu, Discord) |
 | `command` | Execute arbitrary shell command | Custom integrations, scripts, logging |
 
@@ -187,7 +187,7 @@ Your Agent (OpenClaw session)
   │
   ├─ Receives coding task
   ├─ Runs: bg-dispatch --adapter <name> --prompt <task> --workdir <dir>
-  │   ├─ Creates .dev-progress/ (task-spec.json + progress.md)
+  │   ├─ Creates progress.md + meta.json in data/tasks/<task-id>/
   │   ├─ Launches coding agent in background (setsid + PTY)
   │   ├─ Starts watchdog (stall detection + max runtime)
   │   └─ Returns immediately ← your agent is FREE
@@ -197,9 +197,9 @@ Your Agent (OpenClaw session)
   ├─ On completion:
   │   ├─ Hook fires → notify.sh → all configured notifiers
   │   ├─ Watchdog provides fallback if hook fails
-  │   └─ OpenClaw notifier wakes your agent session
+  │   └─ OpenClaw notifier wakes your agent session (instant, no cron delay)
   │
-  ├─ Your agent reads .dev-progress/progress.md
+  ├─ Your agent reads data/tasks/<task-id>/progress.md
   └─ Sends summary to user, creates PR, etc.
 ```
 
@@ -218,15 +218,17 @@ Your Agent (OpenClaw session)
 
 ### Resume Protocol
 
-`.dev-progress/` in the workdir survives container resets (if in git):
+Progress is centralized in `data/tasks/<task-id>/` — outside the project workdir to avoid polluting repos:
 
 ```
-<workdir>/.dev-progress/
-├── task-spec.json     # Full task definition for re-dispatch
-└── progress.md        # What's done, in progress, remaining
+data/tasks/<task-id>/
+├── meta.json          # Full task definition (prompt, adapter, config, status)
+├── progress.md        # What's done, in progress, remaining
+├── output.txt         # Agent output log
+└── watchdog.log       # Watchdog monitoring log
 ```
 
-On resume, the agent reads `progress.md` + `git log` and continues from the last checkpoint.
+On resume, bg-dispatch searches `data/tasks/` for a task matching the workdir and rebuilds the prompt from `meta.json`. The agent reads `progress.md` + `git log` and continues from the last checkpoint. Legacy `.dev-progress/` in the workdir is auto-migrated if found.
 
 ## CLI Reference
 
@@ -240,7 +242,7 @@ Required:
 Options:
   -n, --name NAME            Task name (default: task-<timestamp>)
   -w, --workdir DIR          Working directory (default: cwd)
-  --resume                   Resume from .dev-progress/
+  --resume                   Resume from data/tasks/
   --force                    Kill existing task for same workdir
   --model MODEL              Model override
   --allowed-tools TOOLS      Allowed tools (adapter-specific)
@@ -296,10 +298,10 @@ EOF
 
 ### Step 4: Handle Completion
 
-When the task completes, your agent receives a system event. Read the progress:
+When the task completes, your agent receives a system event. Read the progress from the centralized task directory (path is included in the system event message):
 
 ```bash
-cat /path/to/project/.dev-progress/progress.md
+cat /path/to/bg-dispatch/data/tasks/<task-id>/progress.md
 ```
 
 Then take action: create a PR, notify the user, dispatch the next task.
@@ -357,7 +359,7 @@ bgd logs auth-api --watchdog      # Watchdog log instead
 ### View Progress
 
 ```bash
-bgd progress auth-api             # Show .dev-progress/progress.md
+bgd progress auth-api             # Show progress.md from task data
 ```
 
 ### Cancel a Task
@@ -396,7 +398,7 @@ bg-dispatch/
 │   ├── aider.sh             # Aider adapter
 │   └── codex.sh             # Codex CLI adapter
 ├── notifiers/
-│   ├── openclaw.sh          # OpenClaw cron notifier
+│   ├── openclaw.sh          # OpenClaw system event notifier
 │   ├── webhook.sh           # Generic webhook (Slack/Feishu/Discord)
 │   └── command.sh           # Custom command notifier
 ├── hooks/
