@@ -340,8 +340,10 @@ cmd_status() {
       echo "    Elapsed:  $duration"
       echo "    Workdir:  $workdir"
 
-      # Progress summary
-      local progress_file="$workdir/.dev-progress/progress.md"
+      # Progress summary (centralized in task dir)
+      local task_dir_path
+      task_dir_path="$(dirname "$meta")"
+      local progress_file="$task_dir_path/progress.md"
       if [[ -f "$progress_file" ]]; then
         local summary
         summary=$(_get_progress_summary "$progress_file")
@@ -424,11 +426,11 @@ cmd_show() {
   [[ "$is_resume" == "true" ]] && echo "  Resumed:    yes"
   [[ -n "$callback_session" ]] && [[ "$callback_session" != "null" ]] && echo "  Callback:   $callback_session"
 
-  # Show progress.md if available
-  local progress_file="$workdir/.dev-progress/progress.md"
+  # Show progress.md if available (centralized in task dir)
+  local progress_file="$task_dir/progress.md"
   if [[ -f "$progress_file" ]]; then
     echo ""
-    echo "  Progress (.dev-progress/progress.md):"
+    echo "  Progress (data/tasks/progress.md):"
     echo "  ──────────────────────────────────────"
     sed 's/^/  /' "$progress_file"
   fi
@@ -603,7 +605,7 @@ cmd_progress() {
   if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
     echo "Usage: bgd progress <task-name-or-id>"
     echo ""
-    echo "Show .dev-progress/progress.md from task workdir."
+    echo "Show progress.md from task data directory."
     return 0
   fi
 
@@ -621,7 +623,8 @@ cmd_progress() {
   started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
   task_name=$(jq -r '.task_name // ""' "$meta" 2>/dev/null)
 
-  local progress_file="$workdir/.dev-progress/progress.md"
+  # Progress is centralized in the task data directory
+  local progress_file="$task_dir/progress.md"
   if [[ ! -f "$progress_file" ]]; then
     echo "No progress file found at: $progress_file"
     return 0
@@ -713,11 +716,7 @@ cmd_cancel() {
     '. + {status: "killed", kill_reason: "user_cancelled", completed_at: $ts}' \
     "$meta" > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
 
-  # Update task-spec.json if exists
-  local task_spec="$workdir/.dev-progress/task-spec.json"
-  if [[ -f "$task_spec" ]]; then
-    jq '. + {status: "cancelled"}' "$task_spec" > "${task_spec}.tmp" && mv "${task_spec}.tmp" "$task_spec"
-  fi
+  # Meta.json already updated above with kill status
 
   # Remove lock file
   local workdir_hash lock_file
@@ -761,11 +760,6 @@ cmd_resume() {
     return 1
   fi
 
-  if [[ ! -d "$workdir/.dev-progress" ]]; then
-    echo "Error: No .dev-progress/ found in $workdir — cannot resume" >&2
-    return 1
-  fi
-
   echo "Resuming task: $task_name (adapter: $adapter, workdir: $workdir)"
   exec "$BG_DISPATCH_DIR/bg-dispatch" --adapter "$adapter" --workdir "$workdir" --resume --force
 }
@@ -781,7 +775,7 @@ Commands:
   status                    Quick overview with summary counts
   show <task>               Detailed view of a specific task
   logs <task>               Show task output logs
-  progress <task>           Show .dev-progress/progress.md from workdir
+  progress <task>           Show progress.md from task data from workdir
   cancel <task>             Cancel a running task
   resume <task>             Resume an interrupted task
   clean                     Remove old completed/killed task data

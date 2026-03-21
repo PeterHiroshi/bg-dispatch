@@ -137,12 +137,11 @@ if [ -f "$NOTIFY_SCRIPT" ]; then
   bash "$NOTIFY_SCRIPT" "$META_FILE" >> "$LOG_FILE" 2>&1 || true
   log "Notifications dispatched via notify.sh"
 else
-  # Fallback: direct openclaw cron (backwards compat)
+  # Fallback: direct openclaw system event
   if command -v openclaw >/dev/null 2>&1; then
     EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
-    WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${WORKDIR}/.dev-progress/progress.md."
-    FIRE_AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-    openclaw cron add --name "bgd-done-${TASK_NAME}" --at "$FIRE_AT" --wake now --session main --delete-after-run --system-event "$WAKE_TEXT" >/dev/null 2>&1 || true
+    WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${TASK_DIR}/progress.md."
+    openclaw system event --mode now --text "$WAKE_TEXT" >/dev/null 2>&1 || true
     log "Fallback: OpenClaw notified directly"
   fi
 fi

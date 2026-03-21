@@ -18,16 +18,16 @@ You (chat) → OpenClaw → bg-dispatch → Coding Agent (background)
 ```
 
 1. **Dispatch** — `bg-dispatch` launches the coding agent in the background and returns immediately
-2. **Work** — The agent runs independently, tracking progress in `.dev-progress/`
+2. **Work** — The agent runs independently, tracking progress in `data/tasks/<task-id>/`
 3. **Notify** — On completion, pluggable notifiers wake OpenClaw + alert your team (Slack, Feishu, Discord, etc.)
-4. **Resume** — If interrupted (container reset, crash), the agent resumes from `.dev-progress/`
+4. **Resume** — If interrupted (container reset, crash), the agent resumes from centralized task data
 
 ## Features
 
 - 🚀 **Fire-and-forget** — Main session freed instantly, zero token burn
 - 🔔 **Pluggable notifications** — OpenClaw wake, Slack, Feishu, Discord, custom commands
 - 🔌 **Adapter pattern** — Claude Code, Aider, Codex CLI built-in; add your own easily
-- 🔄 **Resumable** — `.dev-progress/` survives crashes and container resets
+- 🔄 **Resumable** — Centralized task data survives crashes and container resets
 - 🐕 **Watchdog** — Auto-kills stalled tasks, enforces max runtime
 - 🔒 **Workdir locking** — Prevents duplicate agents on the same project
 
@@ -129,7 +129,7 @@ bgd status                        # Quick overview with counts + active details
 bgd show <task>                   # Detailed view (partial name match OK)
 bgd logs <task>                   # Last 50 lines of output (ANSI stripped)
 bgd logs <task> -f                # Follow output in real-time
-bgd progress <task>               # Show .dev-progress/progress.md
+bgd progress <task>               # Show progress.md from task data
 bgd cancel <task>                 # Cancel a running task
 bgd resume <task>                 # Resume interrupted task
 bgd clean                         # Remove done/killed tasks older than 24h
@@ -144,7 +144,7 @@ Status icons: 🏃 running, ✅ done (exit 0), ⚠️ done (exit != 0), ❌ kill
 
 | Notifier | Description | Config |
 |----------|-------------|--------|
-| `openclaw` | Wake OpenClaw session via cron | `session` |
+| `openclaw` | Wake OpenClaw session via system event | `session` |
 | `webhook` | POST to Slack/Feishu/Discord/any URL | `url` or `url_env`, `template` |
 | `command` | Run any shell command | `command`, `timeout` |
 
@@ -207,7 +207,7 @@ bg-dispatch (orchestrator)
 │   ├── aider.sh
 │   └── codex.sh
 ├── notifiers/         # Pluggable notifications
-│   ├── openclaw.sh    # Wake OpenClaw session
+│   ├── openclaw.sh    # Wake OpenClaw session (direct system event)
 │   ├── webhook.sh     # Slack/Feishu/Discord/generic
 │   └── command.sh     # Custom commands
 ├── hooks/
@@ -228,15 +228,17 @@ Agent completes
 
 ### Progress Tracking
 
-Each task creates `.dev-progress/` in the workdir:
+All task data is centralized in `data/tasks/<task-id>/` — outside the project workdir to avoid polluting repos (especially open-source):
 
 ```
-<workdir>/.dev-progress/
-├── task-spec.json   # Task definition (prompt, adapter, config)
-└── progress.md      # Living progress doc (agent updates this)
+data/tasks/<task-id>/
+├── meta.json        # Task definition (prompt, adapter, config, status)
+├── progress.md      # Living progress doc (agent updates this)
+├── output.txt       # Agent output log
+└── watchdog.log     # Watchdog monitoring log
 ```
 
-This enables **resumability**: if the container resets, `--resume` reads these files and the agent picks up where it left off.
+This enables **resumability**: if the container resets, `--resume` searches task data by workdir match and the agent picks up where it left off. Legacy `.dev-progress/` directories are auto-migrated.
 
 ## Configuration
 
@@ -261,7 +263,7 @@ Required:
 Options:
   -n, --name NAME            Task name [default: task-<timestamp>]
   -w, --workdir DIR          Working directory [default: cwd]
-  --resume                   Resume from .dev-progress/
+  --resume                   Resume from data/tasks/
   --force                    Kill existing task for workdir
   --model MODEL              Model override
   --allowed-tools TOOLS      Allowed tools (adapter-specific)
@@ -291,7 +293,7 @@ See [SKILL.md](SKILL.md) for the full skill definition with agent-oriented instr
 - [x] Codex CLI adapter
 - [x] Pluggable notification system (OpenClaw, Slack, Feishu, Discord, custom)
 - [x] Watchdog with three-layer notification guarantee
-- [x] Resume support via `.dev-progress/`
+- [x] Resume support via centralized task data
 - [ ] Cursor Agent adapter (when headless CLI available)
 - [ ] Web dashboard for task monitoring
 - [ ] OpenClaw Skill marketplace listing (ClawhHub)
