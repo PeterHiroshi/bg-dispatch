@@ -161,6 +161,18 @@ while true; do
   if [ -n "$RECENT" ]; then
     LAST_ACTIVITY=$NOW
     touch "$TASK_DIR/pid"
+
+    # Log file activity and update last_activity in meta.json
+    local CHANGED_COUNT
+    CHANGED_COUNT=$(find "$WORKDIR" -not -path "*/.git/*" -newer "$TASK_DIR/pid" -type f 2>/dev/null | wc -l)
+    # pid was just touched, so re-count from a second ago
+    CHANGED_COUNT=$((CHANGED_COUNT + 1))
+    wlog "File activity detected: ${CHANGED_COUNT} files changed"
+
+    local ACTIVITY_TS
+    ACTIVITY_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    jq --arg ts "$ACTIVITY_TS" '. + {last_activity: $ts}' \
+      "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
   fi
 
   # Progress.md completion check
