@@ -216,6 +216,32 @@ Your Agent (OpenClaw session)
 - **Progress.md check** — If `## Status: COMPLETE` appears → clean shutdown + notify
 - **Exit detection** — When process exits, waits for hook, sends fallback if needed
 
+### Progress Monitoring
+
+bg-dispatch provides intermediate progress reporting between dispatch and completion:
+
+- **Periodic polling** — With `--progress-interval 300`, the watchdog runs `git diff --stat` every 5 minutes and appends to `progress.md`
+- **File activity signals** — The watchdog logs file changes to `watchdog.log` and updates `last_activity` in `meta.json` (always-on)
+- **Progress notifications** — Notifiers can subscribe to `progress` events via the `events` config array
+- **Live output** — `bgd logs -f` follows output in real-time while the task is running
+
+#### Notifier Event Configuration
+
+Each notifier can subscribe to specific events. Default is `["complete"]` only:
+
+```json
+{
+  "notifiers": [
+    { "type": "openclaw", "config": { "session": "main" } },
+    { "type": "webhook", "config": { "url_env": "SLACK_WEBHOOK_URL", "template": "slack" }, "events": ["complete", "progress"] }
+  ]
+}
+```
+
+Event types:
+- `complete` — Task finished (default, always sent unless filtered)
+- `progress` — Lightweight mid-task update (must opt-in via `events` array)
+
 ### Resume Protocol
 
 Progress is centralized in `data/tasks/<task-id>/` — outside the project workdir to avoid polluting repos:
@@ -249,6 +275,7 @@ Options:
   --agent-teams              Enable multi-agent mode
   --stall-timeout SECS       Stall timeout (default: 900)
   --max-runtime SECS         Max runtime (default: 7200)
+  --progress-interval SECS   Progress polling interval (default: 0 = disabled)
   --callback-session KEY     OpenClaw session key
   --opt KEY=VALUE            Adapter-specific option (repeatable)
   -h, --help                 Show help
