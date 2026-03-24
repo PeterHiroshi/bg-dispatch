@@ -372,7 +372,8 @@ setsid bash -c '
   cd "$WORKDIR"
 
   # Run agent with PTY via script wrapper
-  script -q -c "bash $LAUNCHER" /dev/null > "$OUTPUT_FILE" 2>&1
+  # Use -f to flush after each write, enabling real-time tail -f on output.txt
+  script -q -f "$OUTPUT_FILE" -c "bash $LAUNCHER" /dev/null 2>&1
   EXIT_CODE=$?
   wait 2>/dev/null || true
 
