@@ -6,8 +6,9 @@
 #   - Stall detection (no file changes in workdir)
 #   - Max runtime enforcement
 #   - Process exit detection + fallback notification
+#   - Periodic progress polling (if progress_interval > 0)
 #
-# Usage: watchdog.sh <task_dir> <bg_pid> <workdir> [stall_timeout] [max_runtime]
+# Usage: watchdog.sh <task_dir> <bg_pid> <workdir> [stall_timeout] [max_runtime] [progress_interval]
 #
 
 set -uo pipefail
@@ -17,6 +18,7 @@ BG_PID="$2"
 WORKDIR="$3"
 STALL_TIMEOUT="${4:-900}"
 MAX_RUNTIME="${5:-7200}"
+PROGRESS_INTERVAL="${6:-0}"
 
 META_FILE="$TASK_DIR/meta.json"
 TASK_NAME=$(jq -r '.task_name // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
@@ -40,7 +42,7 @@ wlog() {
   echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >> "$LOG_FILE"
 }
 
-wlog "Watchdog started. PID=$BG_PID WORKDIR=$WORKDIR STALL=$STALL_TIMEOUT MAX=$MAX_RUNTIME"
+wlog "Watchdog started. PID=$BG_PID WORKDIR=$WORKDIR STALL=$STALL_TIMEOUT MAX=$MAX_RUNTIME PROGRESS=$PROGRESS_INTERVAL"
 
 # === Notification helper ===
 trigger_notify() {
@@ -79,9 +81,43 @@ trigger_notify() {
   [ -n "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
 }
 
+# === Progress polling helper ===
+poll_progress() {
+  local PROGRESS_FILE="$TASK_DIR/progress.md"
+  local TS
+  TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local DIFF_STAT=""
+  local MODIFIED_COUNT=0
+
+  if [[ -d "$WORKDIR/.git" ]]; then
+    DIFF_STAT=$(git -C "$WORKDIR" diff --stat HEAD 2>/dev/null | tail -1 || echo "")
+    MODIFIED_COUNT=$(git -C "$WORKDIR" status --porcelain 2>/dev/null | wc -l || echo "0")
+  fi
+
+  # Append progress entry
+  {
+    echo ""
+    echo "### Progress Poll: $TS"
+    if [[ -n "$DIFF_STAT" ]]; then
+      echo "- Git diff: $DIFF_STAT"
+    fi
+    echo "- Modified/untracked files: $MODIFIED_COUNT"
+  } >> "$PROGRESS_FILE"
+
+  wlog "Progress poll: $MODIFIED_COUNT files modified/untracked"
+
+  # Fire progress notification
+  local NOTIFY_SCRIPT="$BG_DISPATCH_DIR/notify.sh"
+  if [[ -f "$NOTIFY_SCRIPT" ]]; then
+    bash "$NOTIFY_SCRIPT" "$META_FILE" "" "progress" >> "$LOG_FILE" 2>&1 || true
+  fi
+}
+
 # === Main loop ===
 START_TIME=$(date +%s)
 LAST_ACTIVITY=$(date +%s)
+LAST_PROGRESS_CHECK=$(date +%s)
 
 while true; do
   sleep 15
@@ -136,6 +172,15 @@ while true; do
       kill -TERM $BG_PID 2>/dev/null || true
       trigger_notify "progress_complete"
       break
+    fi
+  fi
+
+  # Progress polling check
+  if [[ "$PROGRESS_INTERVAL" -gt 0 ]]; then
+    local SINCE_LAST_PROGRESS=$((NOW - LAST_PROGRESS_CHECK))
+    if [[ "$SINCE_LAST_PROGRESS" -ge "$PROGRESS_INTERVAL" ]]; then
+      poll_progress
+      LAST_PROGRESS_CHECK=$NOW
     fi
   fi
 

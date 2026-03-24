@@ -29,6 +29,7 @@ RESUME_MODE=""
 FORCE_MODE=""
 STALL_TIMEOUT="${BG_DISPATCH_STALL_TIMEOUT:-900}"
 MAX_RUNTIME="${BG_DISPATCH_MAX_RUNTIME:-7200}"
+PROGRESS_INTERVAL="${BG_DISPATCH_PROGRESS_INTERVAL:-0}"
 # Adapter-specific pass-through options (key=value pairs)
 declare -A ADAPTER_OPTS=()
 
@@ -52,6 +53,7 @@ Options:
   --agent-teams              Enable multi-agent/teams mode (passed to adapter)
   --stall-timeout SECS       Stall detection timeout (default: 900 = 15 min)
   --max-runtime SECS         Maximum total runtime (default: 7200 = 2 hours)
+  --progress-interval SECS   Progress polling interval (default: 0 = disabled)
   --callback-session KEY     OpenClaw session key to wake on completion
   --opt KEY=VALUE            Pass adapter-specific option (repeatable)
   -h, --help                 Show this help
@@ -61,6 +63,7 @@ Environment Variables:
   BG_DISPATCH_DATA_DIR       Data directory (default: $BG_DISPATCH_DIR/data)
   BG_DISPATCH_STALL_TIMEOUT  Default stall timeout
   BG_DISPATCH_MAX_RUNTIME    Default max runtime
+  BG_DISPATCH_PROGRESS_INTERVAL  Default progress polling interval
 
 Adapters:
   Each adapter is a shell script in adapters/ that implements build_command()
@@ -94,6 +97,7 @@ while [[ $# -gt 0 ]]; do
     --force)            FORCE_MODE="true"; shift ;;
     --stall-timeout)    STALL_TIMEOUT="$2"; shift 2 ;;
     --max-runtime)      MAX_RUNTIME="$2"; shift 2 ;;
+    --progress-interval) PROGRESS_INTERVAL="$2"; shift 2 ;;
     --opt)
       KEY="${2%%=*}"
       VALUE="${2#*=}"
@@ -323,6 +327,7 @@ jq -n \
   --arg agent_teams "${AGENT_TEAMS:-false}" \
   --arg callback_session "$CALLBACK_SESSION" \
   --argjson is_resume "$(if [[ "$RESUME_MODE" == "true" ]]; then echo true; else echo false; fi)" \
+  --argjson progress_interval "$PROGRESS_INTERVAL" \
   '{
     task_id: $task_id,
     task_name: $task_name,
@@ -336,6 +341,7 @@ jq -n \
     agent_teams: ($agent_teams == "true"),
     callback_session: $callback_session,
     is_resume: $is_resume,
+    progress_interval: $progress_interval,
     status: "running"
   }' > "$META_FILE"
 
@@ -404,7 +410,7 @@ echo "$BG_PID" > "$TASK_DIR/pid"
 # === Launch Watchdog ===
 WATCHDOG_SCRIPT="$BG_DISPATCH_DIR/watchdog.sh"
 if [[ -f "$WATCHDOG_SCRIPT" ]]; then
-  setsid bash "$WATCHDOG_SCRIPT" "$TASK_DIR" "$BG_PID" "$WORKDIR" "$STALL_TIMEOUT" "$MAX_RUNTIME" </dev/null &
+  setsid bash "$WATCHDOG_SCRIPT" "$TASK_DIR" "$BG_PID" "$WORKDIR" "$STALL_TIMEOUT" "$MAX_RUNTIME" "$PROGRESS_INTERVAL" </dev/null &
   WATCHDOG_PID=$!
   disown $WATCHDOG_PID 2>/dev/null || true
   echo "$WATCHDOG_PID" > "$TASK_DIR/watchdog_pid"
@@ -418,7 +424,7 @@ echo "   Model:     $EFFECTIVE_MODEL"
 echo "   Teams:     $([[ "${AGENT_TEAMS:-}" == "true" ]] && echo "YES" || echo "NO")"
 echo "   Progress:  $TASK_DIR/progress.md"
 echo "   PID:       $BG_PID"
-echo "   Watchdog:  ${WATCHDOG_PID:-(none)} (stall: ${STALL_TIMEOUT}s, max: ${MAX_RUNTIME}s)"
+echo "   Watchdog:  ${WATCHDOG_PID:-(none)} (stall: ${STALL_TIMEOUT}s, max: ${MAX_RUNTIME}s, progress: ${PROGRESS_INTERVAL}s)"
 echo "   Output:    $OUTPUT_FILE"
 echo "   Resume:    $([[ "$RESUME_MODE" == "true" ]] && echo "YES" || echo "NO")"
 echo ""
