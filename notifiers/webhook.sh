@@ -152,9 +152,34 @@ _calc_duration() {
   fi
 }
 
+_build_progress_payload() {
+  local TASK_NAME="$1" WORKDIR="$2" MODEL="$3"
+
+  # Gather git diff summary from workdir if available
+  local DIFF_SUMMARY="(no git data)"
+  if [[ -d "$WORKDIR/.git" ]]; then
+    DIFF_SUMMARY=$(git -C "$WORKDIR" diff --stat HEAD 2>/dev/null | tail -1 || echo "(no changes)")
+    local MODIFIED_COUNT
+    MODIFIED_COUNT=$(git -C "$WORKDIR" status --porcelain 2>/dev/null | wc -l || echo "0")
+    DIFF_SUMMARY="${DIFF_SUMMARY}, ${MODIFIED_COUNT} modified/untracked"
+  fi
+
+  cat <<EOF
+{
+  "event": "progress",
+  "task_name": "${TASK_NAME}",
+  "status": "running",
+  "workdir": "${WORKDIR}",
+  "model": "${MODEL}",
+  "diff_summary": $(echo "$DIFF_SUMMARY" | jq -Rs '.')
+}
+EOF
+}
+
 notifier_send() {
   local META_FILE="$1"
   local CONFIG="$2"
+  local EVENT_TYPE="${3:-complete}"
 
   local URL
   URL=$(_resolve_config "$CONFIG" "url" "url_env")
@@ -167,26 +192,34 @@ notifier_send() {
   TEMPLATE=$(echo "$CONFIG" | jq -r '.template // "generic"' 2>/dev/null || echo "generic")
 
   # Read task metadata
-  local TASK_NAME STATUS WORKDIR MODEL EXIT_CODE STARTED_AT COMPLETED_AT
+  local TASK_NAME WORKDIR MODEL
   TASK_NAME=$(jq -r '.task_name // "unknown"' "$META_FILE")
-  STATUS=$(jq -r '.status // "unknown"' "$META_FILE")
   WORKDIR=$(jq -r '.workdir // ""' "$META_FILE")
   MODEL=$(jq -r '.effective_model // .model // "unknown"' "$META_FILE")
-  EXIT_CODE=$(jq -r '.exit_code // "?"' "$META_FILE")
-  STARTED_AT=$(jq -r '.started_at // ""' "$META_FILE")
-  COMPLETED_AT=$(jq -r '.completed_at // ""' "$META_FILE")
 
-  local DURATION
-  DURATION=$(_calc_duration "$STARTED_AT" "$COMPLETED_AT")
-
-  # Build payload
   local PAYLOAD
-  case "$TEMPLATE" in
-    slack)   PAYLOAD=$(_build_slack_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
-    feishu)  PAYLOAD=$(_build_feishu_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
-    discord) PAYLOAD=$(_build_discord_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
-    *)       PAYLOAD=$(_build_generic_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
-  esac
+
+  if [[ "$EVENT_TYPE" == "progress" ]]; then
+    # Compact progress payload
+    PAYLOAD=$(_build_progress_payload "$TASK_NAME" "$WORKDIR" "$MODEL")
+  else
+    # Full completion payload
+    local STATUS EXIT_CODE STARTED_AT COMPLETED_AT
+    STATUS=$(jq -r '.status // "unknown"' "$META_FILE")
+    EXIT_CODE=$(jq -r '.exit_code // "?"' "$META_FILE")
+    STARTED_AT=$(jq -r '.started_at // ""' "$META_FILE")
+    COMPLETED_AT=$(jq -r '.completed_at // ""' "$META_FILE")
+
+    local DURATION
+    DURATION=$(_calc_duration "$STARTED_AT" "$COMPLETED_AT")
+
+    case "$TEMPLATE" in
+      slack)   PAYLOAD=$(_build_slack_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
+      feishu)  PAYLOAD=$(_build_feishu_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
+      discord) PAYLOAD=$(_build_discord_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
+      *)       PAYLOAD=$(_build_generic_payload "$TASK_NAME" "$STATUS" "$DURATION" "$WORKDIR" "$MODEL" "$EXIT_CODE") ;;
+    esac
+  fi
 
   # Feishu signing
   local SECRET
@@ -206,9 +239,9 @@ notifier_send() {
     -d "$PAYLOAD" 2>/dev/null)
 
   if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "204" ]]; then
-    echo "[webhook-notifier] Sent OK ($TEMPLATE → $HTTP_CODE)" >&2
+    echo "[webhook-notifier] Sent OK ($TEMPLATE/$EVENT_TYPE → $HTTP_CODE)" >&2
   else
-    echo "[webhook-notifier] Failed ($TEMPLATE → HTTP $HTTP_CODE)" >&2
+    echo "[webhook-notifier] Failed ($TEMPLATE/$EVENT_TYPE → HTTP $HTTP_CODE)" >&2
     return 1
   fi
 }

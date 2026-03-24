@@ -22,6 +22,7 @@ notifier_validate() {
 notifier_send() {
   local META_FILE="$1"
   local CONFIG="$2"
+  local EVENT_TYPE="${3:-complete}"
 
   local CMD
   CMD=$(echo "$CONFIG" | jq -r '.command // ""' 2>/dev/null || echo "")
@@ -44,11 +45,12 @@ notifier_send() {
   export BGD_COMPLETED_AT=$(jq -r '.completed_at // ""' "$META_FILE")
   export BGD_META_FILE="$META_FILE"
   export BGD_PROGRESS_FILE="$(dirname "$META_FILE")/progress.md"
+  export BGD_EVENT="$EVENT_TYPE"
 
   timeout "$TIMEOUT" bash -c "$CMD" 2>&1 || {
     echo "[command-notifier] Command failed or timed out (${TIMEOUT}s)" >&2
     return 1
   }
 
-  echo "[command-notifier] Command executed successfully" >&2
+  echo "[command-notifier] Command executed successfully ($EVENT_TYPE)" >&2
 }

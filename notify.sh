@@ -5,14 +5,15 @@
 # Reads notifier config from bg-dispatch.json (or defaults to openclaw notifier),
 # then calls each configured notifier in order.
 #
-# Usage: bash notify.sh <meta.json> [config_file]
+# Usage: bash notify.sh <meta.json> [config_file] [event_type]
+#
+# event_type: "complete" (default) or "progress" (lightweight mid-task update)
 #
 # Config format (bg-dispatch.json):
 # {
 #   "notifiers": [
-#     { "type": "openclaw", "config": { "session": "main" } },
-#     { "type": "webhook",  "config": { "url_env": "SLACK_WEBHOOK_URL", "template": "slack" } },
-#     { "type": "webhook",  "config": { "url_env": "FEISHU_WEBHOOK_URL", "template": "feishu" } },
+#     { "type": "openclaw", "config": { "session": "main" }, "events": ["complete"] },
+#     { "type": "webhook",  "config": { "url_env": "SLACK_WEBHOOK_URL", "template": "slack" }, "events": ["complete", "progress"] },
 #     { "type": "command",  "config": { "command": "echo $BGD_TASK_NAME done!" } }
 #   ]
 # }
@@ -25,9 +26,10 @@ NOTIFIERS_DIR="$BG_DISPATCH_DIR/notifiers"
 
 META_FILE="${1:-}"
 CONFIG_FILE="${2:-}"
+EVENT_TYPE="${3:-complete}"
 
 if [[ -z "$META_FILE" ]]; then
-  echo "Usage: notify.sh <meta.json> [config_file]" >&2
+  echo "Usage: notify.sh <meta.json> [config_file] [event_type]" >&2
   exit 1
 fi
 
@@ -87,6 +89,13 @@ for i in $(seq 0 $((NOTIFIER_COUNT - 1))); do
     continue
   fi
 
+  # Check events filter: default is ["complete"] only
+  NEVENTS=$(echo "$NOTIFIER_JSON" | jq -r ".[$i].events // [\"complete\"] | .[]" 2>/dev/null || echo "complete")
+  if ! echo "$NEVENTS" | grep -qx "$EVENT_TYPE"; then
+    echo "$LOG_PREFIX Skipping notifier $NTYPE (event '$EVENT_TYPE' not in events list)" >&2
+    continue
+  fi
+
   NOTIFIER_SCRIPT="$NOTIFIERS_DIR/${NTYPE}.sh"
   if [[ ! -f "$NOTIFIER_SCRIPT" ]]; then
     echo "$LOG_PREFIX Unknown notifier type: $NTYPE (no $NOTIFIER_SCRIPT)" >&2
@@ -98,7 +107,7 @@ for i in $(seq 0 $((NOTIFIER_COUNT - 1))); do
   (
     source "$NOTIFIER_SCRIPT"
     if declare -f notifier_send > /dev/null 2>&1; then
-      notifier_send "$META_FILE" "$NCONFIG"
+      notifier_send "$META_FILE" "$NCONFIG" "$EVENT_TYPE"
     else
       echo "$LOG_PREFIX Notifier $NTYPE missing notifier_send()" >&2
       exit 1
