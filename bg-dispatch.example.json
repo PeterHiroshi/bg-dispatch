@@ -5,6 +5,14 @@
       "config": {
         "session": "main"
       }
+    },
+    {
+      "type": "webhook",
+      "config": {
+        "url_env": "SLACK_WEBHOOK_URL",
+        "template": "slack"
+      },
+      "events": ["complete", "progress"]
     }
   ]
 }

@@ -45,3 +45,14 @@
 | 10 | Update SKILL.md with bgd commands documentation | 🟢 | feature/bgd-cli | Add monitoring section to SKILL.md |
 | 11 | Update README.md with bgd CLI docs | 🟢 | feature/bgd-cli | CLI reference, examples |
 | 12 | Update install.sh to set up bgd in PATH | 🟢 | feature/bgd-cli | Symlink or PATH setup |
+
+### Phase 5 — Hook System Overhaul (Issue #6)
+
+| # | Feature | Status | Branch | Notes |
+|---|---------|--------|--------|-------|
+| 19 | Periodic progress polling in watchdog — `--progress-interval <seconds>` flag | 🟢 | feature/hook-system-overhaul | Watchdog runs `git diff --stat` every N seconds, appends to progress.md |
+| 20 | New notifier event type: `progress` — lightweight mid-task notifications | 🟢 | feature/hook-system-overhaul | notify.sh handles `progress` event distinct from `complete` |
+| 21 | Fix `output.txt` real-time capture — replace `script -q` redirect with `script -f` | 🟢 | feature/hook-system-overhaul | `bgd logs -f` works during execution via script -f flush |
+| 22 | Expose watchdog file-change events as progress signals | 🟢 | feature/hook-system-overhaul | Watchdog logs file changes + updates last_activity in meta.json |
+| 23 | `bgd logs -f <task>` — follow mode with --follow/--lines flags | 🟢 | feature/hook-system-overhaul | Checks task status; if not running, shows last N lines |
+| 24 | Update SKILL.md + README.md with progress hook documentation | 🟢 | feature/hook-system-overhaul | Documented --progress-interval, event config, progress monitoring |

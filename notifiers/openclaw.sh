@@ -21,6 +21,7 @@ notifier_validate() {
 notifier_send() {
   local META_FILE="$1"
   local CONFIG="$2"  # JSON string with notifier config
+  local EVENT_TYPE="${3:-complete}"
 
   if ! command -v openclaw >/dev/null 2>&1; then
     echo "[openclaw-notifier] openclaw CLI not available" >&2
@@ -38,6 +39,18 @@ notifier_send() {
   WORKDIR=$(jq -r '.workdir // ""' "$META_FILE")
   local EFFECTIVE_MODEL
   EFFECTIVE_MODEL=$(jq -r '.effective_model // "unknown"' "$META_FILE")
+
+  # Derive task dir from meta file path for progress reference
+  local TASK_DIR
+  TASK_DIR="$(dirname "$META_FILE")"
+
+  if [[ "$EVENT_TYPE" == "progress" ]]; then
+    # Lightweight progress update — log only, no wake
+    echo "[openclaw-notifier] Progress update for ${TASK_NAME}: session=$SESSION (no wake)" >&2
+    return 0
+  fi
+
+  # Complete event — full wake
   local STARTED_AT
   STARTED_AT=$(jq -r '.started_at // ""' "$META_FILE")
   local COMPLETED_AT
@@ -46,10 +59,6 @@ notifier_send() {
   EXIT_CODE=$(jq -r '.exit_code // "?"' "$META_FILE")
   local STATUS
   STATUS=$(jq -r '.status // "unknown"' "$META_FILE")
-
-  # Derive task dir from meta file path for progress reference
-  local TASK_DIR
-  TASK_DIR="$(dirname "$META_FILE")"
 
   local WAKE_TEXT="🔨 bg-dispatch task done: ${TASK_NAME} (${ADAPTER}). Status: ${STATUS}. Exit: ${EXIT_CODE}. Duration: ${STARTED_AT} → ${COMPLETED_AT}. Workdir: ${WORKDIR}. Model: ${EFFECTIVE_MODEL}. Progress: ${TASK_DIR}/progress.md. Result: ${META_FILE}."
 

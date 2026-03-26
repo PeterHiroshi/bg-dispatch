@@ -453,16 +453,19 @@ cmd_logs() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -n) lines="$2"; shift 2 ;;
-      -f) follow="true"; shift ;;
+      -n|--lines) lines="$2"; shift 2 ;;
+      -f|--follow) follow="true"; shift ;;
       --watchdog) watchdog="true"; shift ;;
       -h|--help)
-        echo "Usage: bgd logs <task-name-or-id> [-n lines] [-f] [--watchdog]"
+        echo "Usage: bgd logs <task-name-or-id> [-n|--lines N] [-f|--follow] [--watchdog]"
         echo ""
         echo "Show task output logs."
-        echo "  -n N          Number of lines (default: 50)"
-        echo "  -f            Follow (tail -f)"
-        echo "  --watchdog    Show watchdog.log instead of output.txt"
+        echo "  -n, --lines N    Number of lines (default: 50)"
+        echo "  -f, --follow     Follow output in real-time (tail -f)"
+        echo "  --watchdog       Show watchdog.log instead of output.txt"
+        echo ""
+        echo "Follow mode attaches to the live output stream while the task"
+        echo "is running. If the task is not running, shows the last N lines."
         return 0
         ;;
       *)
@@ -476,7 +479,7 @@ cmd_logs() {
   done
 
   if [[ -z "$query" ]]; then
-    echo "Usage: bgd logs <task-name-or-id> [-n lines] [-f] [--watchdog]" >&2
+    echo "Usage: bgd logs <task-name-or-id> [-n|--lines N] [-f|--follow] [--watchdog]" >&2
     return 1
   fi
 
@@ -499,7 +502,20 @@ cmd_logs() {
   fi
 
   if [[ "$follow" == "true" ]]; then
-    tail -f "$log_file" | _strip_ansi
+    # Check if task is running
+    local meta="$task_dir/meta.json"
+    local status=""
+    if [[ -f "$meta" ]]; then
+      status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+    fi
+
+    if [[ "$status" == "running" ]]; then
+      echo "Following output (Ctrl+C to stop)..." >&2
+      tail -f "$log_file" | _strip_ansi
+    else
+      echo "Task not running (status: ${status:-unknown}), showing last $lines lines:" >&2
+      tail -n "$lines" "$log_file" | _strip_ansi
+    fi
   else
     tail -n "$lines" "$log_file" | _strip_ansi
   fi
@@ -784,8 +800,8 @@ Commands:
 Options:
   tasks --status <filter>   Filter: running, done, killed, all (default: all)
   tasks --limit <n>         Max tasks to show (default: 20)
-  logs -n <lines>           Number of lines (default: 50)
-  logs -f                   Follow (tail -f)
+  logs -n, --lines <N>      Number of lines (default: 50)
+  logs -f, --follow         Follow output in real-time (tail -f)
   logs --watchdog           Show watchdog.log instead of output.txt
   clean --all               Remove all done/killed (ignore age)
   clean --dry-run           Preview what would be removed
