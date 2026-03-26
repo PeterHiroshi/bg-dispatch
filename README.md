@@ -28,7 +28,8 @@ You (chat) → OpenClaw → bg-dispatch → Coding Agent (background)
 - 🔔 **Pluggable notifications** — OpenClaw wake, Slack, Feishu, Discord, custom commands
 - 🔌 **Adapter pattern** — Claude Code, Aider, Codex CLI built-in; add your own easily
 - 🔄 **Resumable** — Centralized task data survives crashes and container resets
-- 🐕 **Watchdog** — Auto-kills stalled tasks, enforces max runtime
+- 🐕 **Watchdog** — Auto-kills stalled tasks, enforces max runtime, periodic progress polling
+- 📊 **Progress monitoring** — Real-time output streaming, git diff polling, file activity tracking
 - 🔒 **Workdir locking** — Prevents duplicate agents on the same project
 
 ## Quick Start
@@ -226,6 +227,52 @@ Agent completes
   └─→ Watchdog (safety net) → notify.sh  (if hook + fallback both miss)
 ```
 
+All three paths call `notify.sh`, which is **idempotent** — each notifier checks `meta.json`'s `notified.*` fields before sending. First writer wins; duplicates are safely skipped.
+
+### Targeted Session Routing
+
+When dispatching from a specific session (e.g., a Slack channel), pass `--source-session` so the completion notification routes back to the originating session instead of broadcasting:
+
+```bash
+bg-dispatch -a claude-code -p "Fix auth bug" -w ./project \
+  --source-session "channel:C0ANTPRBBJ4"
+```
+
+The `openclaw` notifier uses a **three-level cascade** to guarantee delivery:
+
+| Level | Strategy | When it fires |
+|-------|----------|---------------|
+| L1 | Targeted wake (`source_session`) | If `--source-session` was passed |
+| L2 | Broadcast system event (main session) | If L1 fails or no source session |
+| L3 | Heartbeat pending marker | If L2 also fails (CLI unavailable) |
+
+Level 3 writes `pending_session_notify` to `meta.json`, which `task-check.mjs` surfaces during the next heartbeat poll. The agent then retries delivery.
+
+### Progress Monitoring
+
+bg-dispatch reports intermediate progress between dispatch and completion:
+
+```bash
+# Enable periodic polling (every 5 minutes)
+bg-dispatch -a claude-code -p "Build feature X" -w ./project --progress-interval 300
+
+# Follow live output
+bgd logs my-task -f
+
+# Check watchdog activity log
+bgd logs my-task --watchdog
+```
+
+**Periodic polling** (`--progress-interval`): The watchdog runs `git diff --stat` at the specified interval, appends results to `progress.md`, and fires `progress` notification events.
+
+**File activity signals**: The watchdog always logs file changes to `watchdog.log` and updates `last_activity` in `meta.json` — no configuration needed.
+
+**Notifier events**: Each notifier can subscribe to event types via the `events` array. Default is `["complete"]`. Add `"progress"` to receive mid-task updates:
+
+```json
+{ "type": "webhook", "config": { "url_env": "SLACK_WEBHOOK_URL" }, "events": ["complete", "progress"] }
+```
+
 ### Progress Tracking
 
 All task data is centralized in `data/tasks/<task-id>/` — outside the project workdir to avoid polluting repos (especially open-source):
@@ -250,6 +297,7 @@ This enables **resumability**: if the container resets, `--resume` searches task
 | `BG_DISPATCH_DATA_DIR` | `$BG_DISPATCH_DIR/data` | Runtime data |
 | `BG_DISPATCH_STALL_TIMEOUT` | `900` (15 min) | Inactivity kill threshold |
 | `BG_DISPATCH_MAX_RUNTIME` | `7200` (2 hours) | Maximum total runtime |
+| `BG_DISPATCH_PROGRESS_INTERVAL` | `0` (disabled) | Progress polling interval (seconds) |
 
 ### CLI Reference
 
@@ -270,7 +318,9 @@ Options:
   --agent-teams              Enable multi-agent mode
   --stall-timeout SECS       Stall timeout [default: 900]
   --max-runtime SECS         Max runtime [default: 7200]
+  --progress-interval SECS   Progress polling interval [default: 0 = disabled]
   --callback-session KEY     OpenClaw session key
+  --source-session KEY       Originating session (for targeted notification routing)
   --opt KEY=VALUE            Adapter-specific option (repeatable)
 ```
 

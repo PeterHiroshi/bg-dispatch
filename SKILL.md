@@ -29,7 +29,8 @@ bg-dispatch \
   --adapter claude-code \
   --prompt "Build a REST API with user authentication and rate limiting" \
   --name "user-auth-api" \
-  --workdir /path/to/project
+  --workdir /path/to/project \
+  --source-session "$CURRENT_SESSION_KEY"
 ```
 
 ### Resume After Interruption
@@ -209,12 +210,81 @@ Your Agent (OpenClaw session)
 2. **Process fallback** — Inline completion handler in the background process
 3. **Watchdog** (safety net) — Detects process exit, waits 35s for hook, sends if missed
 
+All three paths call `notify.sh`, which is **idempotent**: each notifier checks `meta.json`'s `notified.*` fields before sending. First writer wins; subsequent calls are safe no-ops. No duplicate notifications even when hook and setsid block race.
+
+### Cascading Session Wake (openclaw notifier)
+
+The `openclaw` notifier uses a three-level cascade to guarantee the agent session is woken, even when the target session is temporarily unavailable:
+
+```
+Level 1: Targeted session wake (source_session)
+  │ ✅ → done (notification delivered to exact originating session)
+  │ ❌ ↓
+Level 2: Broadcast system event (main session)
+  │ ✅ → done (main session picks up the completion)
+  │ ❌ ↓
+Level 3: Heartbeat pending marker
+  │ → writes pending_session_notify to meta.json
+  │ → next heartbeat poll (task-check.mjs) surfaces it
+  └ → agent reads meta.json and delivers the notification
+```
+
+**`--source-session`**: Pass the originating session key when dispatching. The completion notification will be routed directly to that session (Level 1), rather than broadcasting to the main session. This is critical for multi-channel setups where the dispatching session (e.g., a Slack channel) is different from the main agent session.
+
+```bash
+bg-dispatch -a claude-code \
+  -p "Fix auth bug" \
+  -n "auth-fix" \
+  -w /path/to/project \
+  --source-session "channel:C0ANTPRBBJ4"
+```
+
+**Idempotency tracking in meta.json:**
+```json
+{
+  "notified": {
+    "openclaw": true,
+    "webhook_slack": true,
+    "webhook_feishu": false
+  },
+  "pending_session_notify": null
+}
+```
+
+When `pending_session_notify` is non-null, `task-check.mjs` includes it in the output so the heartbeat can retry delivery.
+
 ### Watchdog Behavior
 
 - **Stall detection** — No file changes for 15 min (configurable) → kill + notify
 - **Max runtime** — Hard 2-hour limit (configurable) → kill + notify
 - **Progress.md check** — If `## Status: COMPLETE` appears → clean shutdown + notify
 - **Exit detection** — When process exits, waits for hook, sends fallback if needed
+
+### Progress Monitoring
+
+bg-dispatch provides intermediate progress reporting between dispatch and completion:
+
+- **Periodic polling** — With `--progress-interval 300`, the watchdog runs `git diff --stat` every 5 minutes and appends to `progress.md`
+- **File activity signals** — The watchdog logs file changes to `watchdog.log` and updates `last_activity` in `meta.json` (always-on)
+- **Progress notifications** — Notifiers can subscribe to `progress` events via the `events` config array
+- **Live output** — `bgd logs -f` follows output in real-time while the task is running
+
+#### Notifier Event Configuration
+
+Each notifier can subscribe to specific events. Default is `["complete"]` only:
+
+```json
+{
+  "notifiers": [
+    { "type": "openclaw", "config": { "session": "main" } },
+    { "type": "webhook", "config": { "url_env": "SLACK_WEBHOOK_URL", "template": "slack" }, "events": ["complete", "progress"] }
+  ]
+}
+```
+
+Event types:
+- `complete` — Task finished (default, always sent unless filtered)
+- `progress` — Lightweight mid-task update (must opt-in via `events` array)
 
 ### Resume Protocol
 
@@ -249,7 +319,9 @@ Options:
   --agent-teams              Enable multi-agent mode
   --stall-timeout SECS       Stall timeout (default: 900)
   --max-runtime SECS         Max runtime (default: 7200)
+  --progress-interval SECS   Progress polling interval (default: 0 = disabled)
   --callback-session KEY     OpenClaw session key
+  --source-session KEY       Originating session key (for targeted notification routing)
   --opt KEY=VALUE            Adapter-specific option (repeatable)
   -h, --help                 Show help
 ```
