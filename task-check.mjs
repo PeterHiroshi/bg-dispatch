@@ -52,6 +52,11 @@ if (existsSync(tasksDir)) {
     const meta = readJson(metaPath);
     if (!meta || meta.status !== "done") continue;
 
+    const notified = meta.notified || {};
+    // Backward compat: old `notified: true` means all done
+    const allNotified = meta.notified === true ||
+      (typeof notified === "object" && notified.openclaw === true);
+
     const info = {
       task_name: meta.task_name || "unknown",
       adapter: meta.adapter || "",
@@ -60,10 +65,17 @@ if (existsSync(tasksDir)) {
       agent_teams: meta.agent_teams || false,
       effective_model: meta.effective_model || "",
       completed_at: meta.completed_at || "",
+      source_session: meta.source_session || "",
+      notified: notified,
     };
 
-    if (meta.notified !== true) unnotified.push(info);
-    if (meta.notified === true && meta.pr_created !== true) needsPr.push(info);
+    // Check for pending_session_notify (heartbeat recovery from cascade L3)
+    if (meta.pending_session_notify) {
+      info.pending_session_notify = meta.pending_session_notify;
+    }
+
+    if (!allNotified) unnotified.push(info);
+    if (allNotified && meta.pr_created !== true) needsPr.push(info);
   }
 }
 

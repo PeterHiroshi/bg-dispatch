@@ -25,6 +25,7 @@ MODEL=""
 ALLOWED_TOOLS=""
 AGENT_TEAMS=""
 CALLBACK_SESSION=""
+SOURCE_SESSION=""  # Session key of the originating session (for targeted routing)
 RESUME_MODE=""
 FORCE_MODE=""
 STALL_TIMEOUT="${BG_DISPATCH_STALL_TIMEOUT:-900}"
@@ -55,6 +56,7 @@ Options:
   --max-runtime SECS         Maximum total runtime (default: 7200 = 2 hours)
   --progress-interval SECS   Progress polling interval (default: 0 = disabled)
   --callback-session KEY     OpenClaw session key to wake on completion
+  --source-session KEY       Originating session key (for targeted notification routing)
   --opt KEY=VALUE            Pass adapter-specific option (repeatable)
   -h, --help                 Show this help
 
@@ -93,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --allowed-tools)    ALLOWED_TOOLS="$2"; shift 2 ;;
     --agent-teams)      AGENT_TEAMS="true"; shift ;;
     --callback-session) CALLBACK_SESSION="$2"; shift 2 ;;
+    --source-session) SOURCE_SESSION="$2"; shift 2 ;;
     --resume)           RESUME_MODE="true"; shift ;;
     --force)            FORCE_MODE="true"; shift ;;
     --stall-timeout)    STALL_TIMEOUT="$2"; shift 2 ;;
@@ -326,6 +329,7 @@ jq -n \
   --arg allowed_tools "$ALLOWED_TOOLS" \
   --arg agent_teams "${AGENT_TEAMS:-false}" \
   --arg callback_session "$CALLBACK_SESSION" \
+  --arg source_session "$SOURCE_SESSION" \
   --argjson is_resume "$(if [[ "$RESUME_MODE" == "true" ]]; then echo true; else echo false; fi)" \
   --argjson progress_interval "$PROGRESS_INTERVAL" \
   '{
@@ -340,9 +344,11 @@ jq -n \
     allowed_tools: $allowed_tools,
     agent_teams: ($agent_teams == "true"),
     callback_session: $callback_session,
+    source_session: $source_session,
     is_resume: $is_resume,
     progress_interval: $progress_interval,
-    status: "running"
+    status: "running",
+    notified: {}
   }' > "$META_FILE"
 
 # === Write launcher script ===
@@ -391,6 +397,8 @@ setsid bash -c '
   rm -f "$LOCK_FILE"
 
   # Dispatch notifications via notifier system (fallback — hook should fire first)
+  # Idempotent: notify.sh checks meta.json notified.* fields before sending.
+  # Safe to call from both hook and setsid — first writer wins, second is a no-op.
   sleep 3
   NOTIFY_SCRIPT="'"$BG_DISPATCH_DIR"'/notify.sh"
   if [ -f "$NOTIFY_SCRIPT" ]; then

@@ -56,3 +56,14 @@
 | 22 | Expose watchdog file-change events as progress signals | 🟢 | feature/hook-system-overhaul | Watchdog logs file changes + updates last_activity in meta.json |
 | 23 | `bgd logs -f <task>` — follow mode with --follow/--lines flags | 🟢 | feature/hook-system-overhaul | Checks task status; if not running, shows last N lines |
 | 24 | Update SKILL.md + README.md with progress hook documentation | 🟢 | feature/hook-system-overhaul | Documented --progress-interval, event config, progress monitoring |
+
+### Phase 6 — Session Routing & Idempotent Notifications (distilled from forge-dispatch)
+
+| # | Feature | Status | Branch | Notes |
+|---|---------|--------|--------|-------|
+| 25 | `--source-session` CLI flag + meta.json field | 🟢 | feature/session-routing | Targeted notification routing to originating session |
+| 26 | Cascading session wake in openclaw notifier (L1→L2→L3) | 🟢 | feature/session-routing | Targeted → broadcast → heartbeat pending |
+| 27 | Idempotent notification tracking (`notified.*` per-channel fields) | 🟢 | feature/session-routing | Prevents duplicate notifications from hook/setsid/watchdog race |
+| 28 | Webhook idempotency in notify.sh (`notified.webhook_<template>`) | 🟢 | feature/session-routing | Per-template dedup for webhook notifiers |
+| 29 | `pending_session_notify` heartbeat recovery | 🟢 | feature/session-routing | task-check.mjs surfaces failed notifications for retry |
+| 30 | Update SKILL.md + README.md with session routing docs | 🟢 | feature/session-routing | Cascading wake, idempotency, --source-session |
