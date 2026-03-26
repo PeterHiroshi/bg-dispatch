@@ -227,6 +227,27 @@ Agent completes
   └─→ Watchdog (safety net) → notify.sh  (if hook + fallback both miss)
 ```
 
+All three paths call `notify.sh`, which is **idempotent** — each notifier checks `meta.json`'s `notified.*` fields before sending. First writer wins; duplicates are safely skipped.
+
+### Targeted Session Routing
+
+When dispatching from a specific session (e.g., a Slack channel), pass `--source-session` so the completion notification routes back to the originating session instead of broadcasting:
+
+```bash
+bg-dispatch -a claude-code -p "Fix auth bug" -w ./project \
+  --source-session "channel:C0ANTPRBBJ4"
+```
+
+The `openclaw` notifier uses a **three-level cascade** to guarantee delivery:
+
+| Level | Strategy | When it fires |
+|-------|----------|---------------|
+| L1 | Targeted wake (`source_session`) | If `--source-session` was passed |
+| L2 | Broadcast system event (main session) | If L1 fails or no source session |
+| L3 | Heartbeat pending marker | If L2 also fails (CLI unavailable) |
+
+Level 3 writes `pending_session_notify` to `meta.json`, which `task-check.mjs` surfaces during the next heartbeat poll. The agent then retries delivery.
+
 ### Progress Monitoring
 
 bg-dispatch reports intermediate progress between dispatch and completion:
@@ -299,6 +320,7 @@ Options:
   --max-runtime SECS         Max runtime [default: 7200]
   --progress-interval SECS   Progress polling interval [default: 0 = disabled]
   --callback-session KEY     OpenClaw session key
+  --source-session KEY       Originating session (for targeted notification routing)
   --opt KEY=VALUE            Adapter-specific option (repeatable)
 ```
 

@@ -40,6 +40,16 @@ fi
 
 LOG_PREFIX="[bg-dispatch-notify]"
 
+# === Helper: atomically update a notified field in meta.json ===
+update_notified() {
+  local FIELD="$1"
+  local VALUE="${2:-true}"
+  jq --arg f "$FIELD" --argjson v "$VALUE" '
+    .notified = (.notified // {}) | .notified[$f] = $v
+  ' "$META_FILE" > "${META_FILE}.notify-tmp" 2>/dev/null && \
+    mv "${META_FILE}.notify-tmp" "$META_FILE" 2>/dev/null
+}
+
 # === Find config file ===
 if [[ -z "$CONFIG_FILE" ]]; then
   # Search order: workdir, data dir, install dir
@@ -103,6 +113,21 @@ for i in $(seq 0 $((NOTIFIER_COUNT - 1))); do
     continue
   fi
 
+  # Idempotency: check if this notifier type already sent
+  # Each notifier manages its own notified.* field in meta.json.
+  # openclaw notifier checks internally; webhook notifiers checked here.
+  if [[ "$NTYPE" == "webhook" ]]; then
+    # Use template name as the notified key (e.g., notified.webhook_slack)
+    TEMPLATE_NAME=$(echo "$NCONFIG" | jq -r '.template // "generic"' 2>/dev/null || echo "generic")
+    NOTIFIED_KEY="webhook_${TEMPLATE_NAME}"
+    ALREADY_SENT=$(jq -r ".notified.${NOTIFIED_KEY} // false" "$META_FILE" 2>/dev/null || echo "false")
+    if [[ "$ALREADY_SENT" == "true" ]]; then
+      echo "$LOG_PREFIX Skipping $NTYPE ($TEMPLATE_NAME): already sent (idempotent)" >&2
+      SUCCESS=$((SUCCESS + 1))
+      continue
+    fi
+  fi
+
   # Source notifier in a subshell to isolate function definitions
   (
     source "$NOTIFIER_SCRIPT"
@@ -116,6 +141,11 @@ for i in $(seq 0 $((NOTIFIER_COUNT - 1))); do
 
   if [[ $? -eq 0 ]]; then
     SUCCESS=$((SUCCESS + 1))
+    # Track webhook notifications in meta.json for idempotency
+    if [[ "$NTYPE" == "webhook" ]]; then
+      TEMPLATE_NAME=$(echo "$NCONFIG" | jq -r '.template // "generic"' 2>/dev/null || echo "generic")
+      update_notified "webhook_${TEMPLATE_NAME}"
+    fi
   else
     FAILED=$((FAILED + 1))
   fi

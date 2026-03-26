@@ -131,7 +131,10 @@ jq --arg ts "$COMPLETED_AT" '. + {completed_at: $ts, status: "done", completion_
 
 log "Result written: $RESULT_FILE"
 
-# === Dispatch notifications via notifier system ===
+# === Dispatch notifications via notifier system (idempotent) ===
+# Both hook and setsid block call notify.sh. The openclaw notifier checks
+# meta.json notified.openclaw before sending — first writer wins,
+# second call is a safe no-op. No duplicate notifications.
 NOTIFY_SCRIPT="$BG_DISPATCH_DIR/notify.sh"
 if [ -f "$NOTIFY_SCRIPT" ]; then
   bash "$NOTIFY_SCRIPT" "$META_FILE" >> "$LOG_FILE" 2>&1 || true
